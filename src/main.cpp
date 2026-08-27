@@ -1,7 +1,9 @@
 #include <Arduino.h>
 #include "esp_timer.h"
+#include <time.h>
+#include <sys/time.h>
 
-#define FW_VERSION "ver2.00.00"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "ver2.01.00"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 27;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
@@ -26,6 +28,9 @@ static volatile uint32_t lastEdgeUs = 0;
 static bool detached    = false;
 static bool isrAttached = false;
 static uint32_t sendIdx = 0;              // 发送端计数(= 输出里的 aa),只有 loop 碰
+
+static bool     timeIsSet       = false;  // 是否已用 'T' 命令设过墙上时间
+static uint32_t timeMsgAnchorMs = 0;      // 每分钟时间播报的基准(millis)
 
 void IRAM_ATTR onFalling() {
   if (!started) return;                              // 's' 之前的脉冲忽略
@@ -58,6 +63,43 @@ void resetState() {
   t0_tick = (uint32_t)(now / TICK_US);               // 时间原点 = 现在
 }
 
+// 把当前墙上时间格式化成 "YYYY-MM-DD HH:MM:SS"
+void fmtNow(char *out, size_t n) {
+  time_t now = time(NULL);
+  struct tm tm;
+  localtime_r(&now, &tm);
+  strftime(out, n, "%Y-%m-%d %H:%M:%S", &tm);
+}
+
+// 收到 'T YYYYMMDD HHMMSS':设定墙上时间
+void setTimeCmd(const char *s) {
+  int Y, Mo, Da, H, Mi, Se;
+  if (sscanf(s, "T %4d%2d%2d %2d%2d%2d", &Y, &Mo, &Da, &H, &Mi, &Se) != 6) {
+    Serial.println("bad time, use: T YYYYMMDD HHMMSS");
+    return;
+  }
+  struct tm tm = {0};
+  tm.tm_year = Y - 1900;
+  tm.tm_mon  = Mo - 1;
+  tm.tm_mday = Da;
+  tm.tm_hour = H;
+  tm.tm_min  = Mi;
+  tm.tm_sec  = Se;
+  time_t epoch = mktime(&tm);
+  if (epoch == (time_t)-1) { Serial.println("bad time value"); return; }
+
+  struct timeval tv;
+  tv.tv_sec  = epoch;
+  tv.tv_usec = 0;
+  settimeofday(&tv, NULL);
+  timeIsSet = true;
+
+  char buf[24];
+  fmtNow(buf, sizeof(buf));
+  Serial.print("time set: ");
+  Serial.println(buf);
+}
+
 // 收到 's'/'S':此刻即 t=0,复位并开始采集
 void startSensing() {
   if (isrAttached) detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
@@ -66,7 +108,16 @@ void startSensing() {
   started = true;
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onFalling, FALLING);
   isrAttached = true;
-  Serial.println("start, t=0ms");
+  timeMsgAnchorMs = millis();                          // 每分钟播报从现在起算
+
+  if (timeIsSet) {
+    char buf[24];
+    fmtNow(buf, sizeof(buf));
+    Serial.print("start, t=0 @ ");
+    Serial.println(buf);
+  } else {
+    Serial.println("start, t=0  (clock not set, send 'T YYYYMMDD HHMMSS')");
+  }
 }
 
 // 收到 'r'/'R':计数器归零(时间原点 = 现在,次数清零,清空缓冲),保持当前启停状态
@@ -98,8 +149,10 @@ void printHelp() {
   Serial.println("  s/S   - start sensing, t=0 at this moment");
   Serial.println("  p/P   - stop sensing (buffered pulses keep flushing)");
   Serial.println("  r/R   - zero counters (t=0 now, aa=0, clear buffer), keep run/stop state");
+  Serial.println("  T ... - set clock: T YYYYMMDD HHMMSS  (e.g. T 20260827 140000)");
   Serial.println("  ping  - reply 'pong'");
   Serial.println("  ?     - print this list");
+  Serial.println("after s/S: prints start time, then 'time:' line every 60s (if clock set)");
 }
 
 // 处理一行串口命令
@@ -107,6 +160,7 @@ void handleCmd(const char *s) {
   if      (!strcmp(s, "s") || !strcmp(s, "S")) startSensing();
   else if (!strcmp(s, "p") || !strcmp(s, "P")) stopSensing();
   else if (!strcmp(s, "r") || !strcmp(s, "R")) zeroCounters();
+  else if (s[0] == 'T' && (s[1] == ' ' || s[1] == '\0')) setTimeCmd(s);
   else if (!strcmp(s, "?"))                    printHelp();
   else if (!strcmp(s, "ping"))                 Serial.println("pong");
   else if (s[0] != '\0') { Serial.print("unknown cmd: "); Serial.println(s); }
@@ -128,6 +182,8 @@ void setup() {
   Serial.setTxBufferSize(TX_BUF_BYTES);              // 必须在 begin 之前
   Serial.begin(115200);
   delay(50);
+  setenv("TZ", "UTC0", 1);                           // 不做时区换算,输入几点就是几点
+  tzset();
   Serial.println("I am starting... " FW_VERSION);    // 启动信息
 
   pinMode(LED_PIN, OUTPUT);
@@ -151,9 +207,18 @@ void loop() {
     digitalWrite(LED_PIN, ledState);
   }
 
-  // ---- 处理来自串口的命令(s / p / r / ping) ----
+  // ---- 处理来自串口的命令(s / p / r / T / ping) ----
   // 采集只在收到 'p'/'P' 时停止,没有自动停止
   pollSerialInput();
+
+  // ---- 's' 之后每 60 秒播报一次绝对时间(需已设时钟) ----
+  if (started && timeIsSet && (nowMs - timeMsgAnchorMs) >= 60000) {
+    timeMsgAnchorMs += 60000;
+    char buf[24];
+    fmtNow(buf, sizeof(buf));
+    Serial.print("time: ");
+    Serial.println(buf);
+  }
 
   // ---- 非阻塞发送:一次发一条,串口没空间就留在缓冲里下轮再发 ----
   if (tail != head) {
