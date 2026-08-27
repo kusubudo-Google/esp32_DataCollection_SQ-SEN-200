@@ -3,7 +3,7 @@
 #include <time.h>
 #include <sys/time.h>
 
-#define FW_VERSION "ver2.04.00"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "ver2.05.00"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 27;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
@@ -101,8 +101,12 @@ void setTimeCmd(const char *s) {
   Serial.println(buf);
 }
 
-// 收到 's'/'S':此刻即 t=0,复位并开始采集
+// 收到 's'/'S':此刻即 t=0,复位并开始采集(必须先设时钟)
 void startSensing() {
+  if (!timeIsSet) {
+    Serial.println("clock not set, send 'T YYYYMMDD HHMMSS' before 's'");
+    return;
+  }
   if (isrAttached) detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
   resetState();
   detached = false;
@@ -110,14 +114,10 @@ void startSensing() {
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onFalling, FALLING);
   isrAttached = true;
 
-  if (timeIsSet) {
-    char buf[24];
-    fmtNow(buf, sizeof(buf));
-    Serial.print("start, t=0 @ ");
-    Serial.println(buf);
-  } else {
-    Serial.println("start, t=0  (clock not set, send 'T YYYYMMDD HHMMSS')");
-  }
+  char buf[24];
+  fmtNow(buf, sizeof(buf));
+  Serial.print("start, t=0 @ ");
+  Serial.println(buf);
 }
 
 // 收到 'r'/'R':计数器归零(时间原点 = 现在,次数清零,清空缓冲),保持当前启停状态
@@ -146,7 +146,7 @@ void stopSensing() {
 void printHelp() {
   Serial.println("SQ-SEN-200 vibration logger  " FW_VERSION);
   Serial.println("commands:");
-  Serial.println("  s/S   - start sensing, t=0 at this moment");
+  Serial.println("  s/S   - start sensing, t=0 at this moment (clock must be set first)");
   Serial.println("  p/P   - stop sensing (buffered pulses keep flushing)");
   Serial.println("  r/R   - zero counters (t=0 now, aa=0, clear buffer), keep run/stop state");
   Serial.println("  T ... - set clock: T YYYYMMDD HHMMSS  (e.g. T 20260827 140000)");

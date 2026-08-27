@@ -9,6 +9,11 @@
 
 ---
 
+## ver2.05.00 — 2026-08-27
+
+- `s`/`S` 现在要求**先设时钟**:未设时钟时拒绝启动,回 `clock not set, send 'T YYYYMMDD HHMMSS' before 's'`
+- 因此 `start` 行必定带绝对时间(不再有 "clock not set" 分支)
+
 ## ver2.04.00 — 2026-08-27
 
 - **修复** `time:` 播报失控(连续刷屏):旧逻辑用 `millis()` 滚动 60s + 单个 `if` 补偿,落后时会无符号下溢导致每个 loop 都打印
