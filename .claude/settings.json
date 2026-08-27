@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/scripts/version-git-sync.sh\"",
+            "timeout": 60,
+            "statusMessage": "Checking FW_VERSION for git sync..."
+          }
+        ]
+      }
+    ]
+  }
+}
