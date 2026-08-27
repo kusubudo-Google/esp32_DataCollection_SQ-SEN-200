@@ -3,7 +3,7 @@
 #include <time.h>
 #include <sys/time.h>
 
-#define FW_VERSION "ver2.01.00"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "ver2.02.00"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 27;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
@@ -150,6 +150,7 @@ void printHelp() {
   Serial.println("  p/P   - stop sensing (buffered pulses keep flushing)");
   Serial.println("  r/R   - zero counters (t=0 now, aa=0, clear buffer), keep run/stop state");
   Serial.println("  T ... - set clock: T YYYYMMDD HHMMSS  (e.g. T 20260827 140000)");
+  Serial.println("  time  - print current clock (or 'not set')");
   Serial.println("  ping  - reply 'pong'");
   Serial.println("  ?     - print this list");
   Serial.println("after s/S: prints start time, then 'time:' line every 60s (if clock set)");
@@ -161,6 +162,16 @@ void handleCmd(const char *s) {
   else if (!strcmp(s, "p") || !strcmp(s, "P")) stopSensing();
   else if (!strcmp(s, "r") || !strcmp(s, "R")) zeroCounters();
   else if (s[0] == 'T' && (s[1] == ' ' || s[1] == '\0')) setTimeCmd(s);
+  else if (!strcmp(s, "time")) {
+    if (timeIsSet) {
+      char buf[24];
+      fmtNow(buf, sizeof(buf));
+      Serial.print("time: ");
+      Serial.println(buf);
+    } else {
+      Serial.println("clock not set, send 'T YYYYMMDD HHMMSS'");
+    }
+  }
   else if (!strcmp(s, "?"))                    printHelp();
   else if (!strcmp(s, "ping"))                 Serial.println("pong");
   else if (s[0] != '\0') { Serial.print("unknown cmd: "); Serial.println(s); }
