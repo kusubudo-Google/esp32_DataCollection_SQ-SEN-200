@@ -3,7 +3,7 @@
 #include <time.h>
 #include <sys/time.h>
 
-#define FW_VERSION "ver2.02.00"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "ver2.03.00"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 27;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
@@ -30,7 +30,7 @@ static bool isrAttached = false;
 static uint32_t sendIdx = 0;              // 发送端计数(= 输出里的 aa),只有 loop 碰
 
 static bool     timeIsSet       = false;  // 是否已用 'T' 命令设过墙上时间
-static uint32_t timeMsgAnchorMs = 0;      // 每分钟时间播报的基准(millis)
+static uint32_t timeMsgAnchorMs = 0;      // 每分钟时间播报的基准(millis),设时钟时起算
 
 void IRAM_ATTR onFalling() {
   if (!started) return;                              // 's' 之前的脉冲忽略
@@ -93,6 +93,7 @@ void setTimeCmd(const char *s) {
   tv.tv_usec = 0;
   settimeofday(&tv, NULL);
   timeIsSet = true;
+  timeMsgAnchorMs = millis();                 // 每分钟播报从设时钟这一刻起算
 
   char buf[24];
   fmtNow(buf, sizeof(buf));
@@ -108,7 +109,6 @@ void startSensing() {
   started = true;
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onFalling, FALLING);
   isrAttached = true;
-  timeMsgAnchorMs = millis();                          // 每分钟播报从现在起算
 
   if (timeIsSet) {
     char buf[24];
@@ -153,7 +153,7 @@ void printHelp() {
   Serial.println("  time  - print current clock (or 'not set')");
   Serial.println("  ping  - reply 'pong'");
   Serial.println("  ?     - print this list");
-  Serial.println("after s/S: prints start time, then 'time:' line every 60s (if clock set)");
+  Serial.println("once clock is set: 'time:' line every 60s (sensing or not); s/S also prints start time");
 }
 
 // 处理一行串口命令
@@ -222,8 +222,8 @@ void loop() {
   // 采集只在收到 'p'/'P' 时停止,没有自动停止
   pollSerialInput();
 
-  // ---- 's' 之后每 60 秒播报一次绝对时间(需已设时钟) ----
-  if (started && timeIsSet && (nowMs - timeMsgAnchorMs) >= 60000) {
+  // ---- 每 60 秒播报一次绝对时间(需已设时钟;是否在采集都播报) ----
+  if (timeIsSet && (nowMs - timeMsgAnchorMs) >= 60000) {
     timeMsgAnchorMs += 60000;
     char buf[24];
     fmtNow(buf, sizeof(buf));
