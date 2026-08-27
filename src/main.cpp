@@ -3,7 +3,7 @@
 #include <time.h>
 #include <sys/time.h>
 
-#define FW_VERSION "ver3.02.00"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "ver3.03.00"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 27;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
@@ -171,7 +171,14 @@ void zeroCounters() {
   } else {
     clearBuffer();
   }
-  Serial.println("pulse counter reset (aa=1, buffer cleared)");
+  Serial.print("pulse counter reset (aa=1, buffer cleared)");
+  if (timeIsSet) {
+    char buf[24];
+    fmtNow(buf, sizeof(buf));
+    Serial.print(" @ ");
+    Serial.print(buf);
+  }
+  Serial.println();
 }
 
 // 收到 'p'/'P':立即停止采集(缓冲里已有的会继续发完)
@@ -190,7 +197,7 @@ void printHelp() {
   Serial.println("commands:");
   Serial.println("  s/S   - start sensing (clock must be set first)");
   Serial.println("  p/P   - stop sensing (buffered pulses keep flushing)");
-  Serial.println("  r/R   - reset pulse counter (aa=1, clear buffer); clock untouched");
+  Serial.println("  r/R   - reset pulse counter (aa=1, clear buffer) + show time; clock untouched");
   Serial.println("  T ... - set clock: T YYYYMMDD HHMMSS  (e.g. T 20260827 140000)");
   Serial.println("  time  - print current clock (or 'not set')");
   Serial.println("  ping  - reply 'pong'");
