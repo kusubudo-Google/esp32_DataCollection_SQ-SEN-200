@@ -3,7 +3,7 @@
 #include <time.h>
 #include <sys/time.h>
 
-#define FW_VERSION "ver2.05.00"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "ver2.06.00"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 27;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
@@ -152,8 +152,19 @@ void printHelp() {
   Serial.println("  T ... - set clock: T YYYYMMDD HHMMSS  (e.g. T 20260827 140000)");
   Serial.println("  time  - print current clock (or 'not set')");
   Serial.println("  ping  - reply 'pong'");
-  Serial.println("  ?     - print this list");
+  Serial.println("  ?     - print this list + current state");
   Serial.println("once clock is set: 'time:' line at each whole minute (sensing or not); s/S also prints start time");
+
+  Serial.print("state: ");
+  Serial.println(started ? "sensing" : "stopped");
+  if (timeIsSet) {
+    char buf[24];
+    fmtNow(buf, sizeof(buf));
+    Serial.print("clock: ");
+    Serial.println(buf);
+  } else {
+    Serial.println("clock: not set");
+  }
 }
 
 // 处理一行串口命令

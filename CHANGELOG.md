@@ -9,6 +9,10 @@
 
 ---
 
+## ver2.06.00 — 2026-08-27
+
+- `?` 末尾加两行状态:`state: sensing` / `state: stopped`,以及 `clock: <时间>` / `clock: not set`
+
 ## ver2.05.00 — 2026-08-27
 
 - `s`/`S` 现在要求**先设时钟**:未设时钟时拒绝启动,回 `clock not set, send 'T YYYYMMDD HHMMSS' before 's'`
