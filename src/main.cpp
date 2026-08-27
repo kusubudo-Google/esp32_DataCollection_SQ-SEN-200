@@ -3,7 +3,7 @@
 #include <time.h>
 #include <sys/time.h>
 
-#define FW_VERSION "ver3.01.00"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "ver3.02.00"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 27;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
@@ -63,13 +63,18 @@ void IRAM_ATTR onFalling() {
   }
 }
 
-// 清空缓冲、所有计数归零、刷新时间锚点(不改动启停状态)
-void resetState() {
+// 只清空缓冲和计数(不动时间锚点)
+void clearBuffer() {
   head = tail = 0;
   dropped = 0;
   pulseCount = 0;
   sendIdx = 1;                                       // aa 从 1 开始
   lastEdgeUs = (uint32_t)esp_timer_get_time();
+}
+
+// clearBuffer + 刷新时间锚点(用于 's' 开始采集)
+void resetState() {
+  clearBuffer();
   captureAnchor();
 }
 
@@ -157,17 +162,16 @@ void startSensing() {
   Serial.println(buf);            // 's' 的确切时刻;基准 = 向下取整到整分
 }
 
-// 收到 'r'/'R':次数归零、清空缓冲、刷新时间锚点,保持当前启停状态
+// 收到 'r'/'R':只复位脉冲计数 + 清空缓冲(不动时钟/时间基准),保持当前启停状态
 void zeroCounters() {
   if (started && isrAttached) {
-    detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));   // 归零期间挡住 ISR
-    resetState();
+    detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));   // 清缓冲期间挡住 ISR
+    clearBuffer();
     attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onFalling, FALLING);
   } else {
-    resetState();
+    clearBuffer();
   }
-  Serial.println("counters zeroed (aa=0, buffer cleared)");
-  if (timeIsSet) emitTimeBase();          // 让下位机重新对齐基准
+  Serial.println("pulse counter reset (aa=1, buffer cleared)");
 }
 
 // 收到 'p'/'P':立即停止采集(缓冲里已有的会继续发完)
@@ -186,7 +190,7 @@ void printHelp() {
   Serial.println("commands:");
   Serial.println("  s/S   - start sensing (clock must be set first)");
   Serial.println("  p/P   - stop sensing (buffered pulses keep flushing)");
-  Serial.println("  r/R   - zero counters (aa=0, clear buffer), keep run/stop state");
+  Serial.println("  r/R   - reset pulse counter (aa=1, clear buffer); clock untouched");
   Serial.println("  T ... - set clock: T YYYYMMDD HHMMSS  (e.g. T 20260827 140000)");
   Serial.println("  time  - print current clock (or 'not set')");
   Serial.println("  ping  - reply 'pong'");
