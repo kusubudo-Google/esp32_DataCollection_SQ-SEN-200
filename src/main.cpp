@@ -3,7 +3,7 @@
 #include <time.h>
 #include <sys/time.h>
 
-#define FW_VERSION "ver2.03.00"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "ver2.04.00"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 27;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
@@ -29,8 +29,8 @@ static bool detached    = false;
 static bool isrAttached = false;
 static uint32_t sendIdx = 0;              // 发送端计数(= 输出里的 aa),只有 loop 碰
 
-static bool     timeIsSet       = false;  // 是否已用 'T' 命令设过墙上时间
-static uint32_t timeMsgAnchorMs = 0;      // 每分钟时间播报的基准(millis),设时钟时起算
+static bool timeIsSet    = false;  // 是否已用 'T' 命令设过墙上时间
+static long lastTimeMin  = -1;     // 上次播报的"墙上分钟号"(epoch/60),用于整分触发一次
 
 void IRAM_ATTR onFalling() {
   if (!started) return;                              // 's' 之前的脉冲忽略
@@ -93,7 +93,7 @@ void setTimeCmd(const char *s) {
   tv.tv_usec = 0;
   settimeofday(&tv, NULL);
   timeIsSet = true;
-  timeMsgAnchorMs = millis();                 // 每分钟播报从设时钟这一刻起算
+  lastTimeMin = (long)(epoch / 60);           // 当前这一分钟不补播,下一整分才播
 
   char buf[24];
   fmtNow(buf, sizeof(buf));
@@ -153,7 +153,7 @@ void printHelp() {
   Serial.println("  time  - print current clock (or 'not set')");
   Serial.println("  ping  - reply 'pong'");
   Serial.println("  ?     - print this list");
-  Serial.println("once clock is set: 'time:' line every 60s (sensing or not); s/S also prints start time");
+  Serial.println("once clock is set: 'time:' line at each whole minute (sensing or not); s/S also prints start time");
 }
 
 // 处理一行串口命令
@@ -222,13 +222,16 @@ void loop() {
   // 采集只在收到 'p'/'P' 时停止,没有自动停止
   pollSerialInput();
 
-  // ---- 每 60 秒播报一次绝对时间(需已设时钟;是否在采集都播报) ----
-  if (timeIsSet && (nowMs - timeMsgAnchorMs) >= 60000) {
-    timeMsgAnchorMs += 60000;
-    char buf[24];
-    fmtNow(buf, sizeof(buf));
-    Serial.print("time: ");
-    Serial.println(buf);
+  // ---- 每到墙上时钟整分播报一次绝对时间(需已设时钟;是否在采集都播报) ----
+  if (timeIsSet) {
+    long m = (long)(time(NULL) / 60);
+    if (m != lastTimeMin) {
+      lastTimeMin = m;
+      char buf[24];
+      fmtNow(buf, sizeof(buf));
+      Serial.print("time: ");
+      Serial.println(buf);
+    }
   }
 
   // ---- 非阻塞发送:一次发一条,串口没空间就留在缓冲里下轮再发 ----
