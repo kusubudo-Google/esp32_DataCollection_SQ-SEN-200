@@ -3,7 +3,7 @@
 #include <time.h>
 #include <sys/time.h>
 
-#define FW_VERSION "ver3.00.00"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "ver3.01.00"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 27;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
@@ -28,7 +28,7 @@ static volatile int64_t anchorEpochUs = 0;      // 锚点:同一时刻的墙上�
 static volatile uint32_t lastEdgeUs   = 0;
 static bool detached    = false;
 static bool isrAttached = false;
-static uint32_t sendIdx = 0;              // 发送端计数(= 输出里的 aa),只有 loop 碰
+static uint32_t sendIdx = 1;              // 发送端计数(= 输出里的 aa,从 1 开始),只有 loop 碰
 
 static bool timeIsSet    = false;  // 是否已用 'T' 命令设过墙上时间
 static long lastTimeMin  = -1;     // 上次播报的"墙上分钟号"(epoch/60),用于整分触发一次
@@ -68,7 +68,7 @@ void resetState() {
   head = tail = 0;
   dropped = 0;
   pulseCount = 0;
-  sendIdx = 0;
+  sendIdx = 1;                                       // aa 从 1 开始
   lastEdgeUs = (uint32_t)esp_timer_get_time();
   captureAnchor();
 }
@@ -154,8 +154,7 @@ void startSensing() {
   char buf[24];
   fmtNow(buf, sizeof(buf));
   Serial.print("start @ ");
-  Serial.println(buf);            // 's' 的确切时刻(未必是整 0 秒)
-  emitTimeBase();                 // 紧接着给出本整分基准: "time: ... HH:MM:00"
+  Serial.println(buf);            // 's' 的确切时刻;基准 = 向下取整到整分
 }
 
 // 收到 'r'/'R':次数归零、清空缓冲、刷新时间锚点,保持当前启停状态
