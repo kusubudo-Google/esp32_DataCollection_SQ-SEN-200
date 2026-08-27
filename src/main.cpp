@@ -1,19 +1,19 @@
 #include <Arduino.h>
 #include "esp_timer.h"
 
-#define FW_VERSION "ver1.00.00"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "ver2.00.00"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 27;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
 constexpr uint32_t LED_INTERVAL_MS = 500;
 constexpr int      SENSOR_PIN      = 33;    // 振动传感器输入(IO33,仅输入脚,OK)
-constexpr uint32_t TICK_US         = 1000;  // 时间计数器分辨率 = 1 ms
+constexpr uint32_t TICK_US         = 100;   // 时间计数器分辨率 = 0.1 ms(时间戳单位 = 100µs)
 constexpr uint32_t MIN_GAP_US      = 0;     // 去抖:两次下降沿最小间隔(µs),0 = 关闭
 constexpr uint32_t BUF_SIZE        = 4096;  // 环形缓冲记录数(必须是 2 的幂)
 constexpr uint32_t TX_BUF_BYTES    = 2048;  // 串口发送软缓冲
 
 // ---------------- 环形缓冲(单生产者 ISR / 单消费者 loop,无需加锁) ----------------
-// 只存相对时间(ms),次数由发送端自己数。用 uint32 以防时间超过 65535ms
+// 只存相对时间(单位 100µs),次数由发送端自己数。uint32 在此单位下可存 ~5 天
 static uint32_t ring[BUF_SIZE];
 static volatile uint32_t head = 0;        // ISR 写
 static volatile uint32_t tail = 0;        // loop 读
@@ -21,7 +21,7 @@ static volatile uint32_t dropped = 0;     // 缓冲满导致的丢失计数(正�
 static volatile uint32_t pulseCount = 0;  // ISR 侧总脉冲数(含被丢弃的),仅诊断用
 
 static volatile bool     started    = false;  // true 表示已收到 's',正在计时采集
-static volatile uint32_t t0_ms      = 0;      // 时间原点(收到 's' 的时刻,单位 ms)
+static volatile uint32_t t0_tick    = 0;      // 时间原点(收到 's' 的时刻,单位 = TICK_US)
 static volatile uint32_t lastEdgeUs = 0;
 static bool detached    = false;
 static bool isrAttached = false;
@@ -36,7 +36,7 @@ void IRAM_ATTR onFalling() {
   lastEdgeUs = us;
 
   pulseCount++;
-  uint32_t t = (uint32_t)(now / TICK_US) - t0_ms;    // 相对 's' 的毫秒数
+  uint32_t t = (uint32_t)(now / TICK_US) - t0_tick;  // 相对 's' 的时间(单位 TICK_US)
 
   uint32_t next = (head + 1) & (BUF_SIZE - 1);
   if (next == tail) {
@@ -55,7 +55,7 @@ void resetState() {
   sendIdx = 0;
   int64_t now = esp_timer_get_time();
   lastEdgeUs = (uint32_t)now;
-  t0_ms = (uint32_t)(now / TICK_US);                 // 时间原点 = 现在
+  t0_tick = (uint32_t)(now / TICK_US);               // 时间原点 = 现在
 }
 
 // 收到 's'/'S':此刻即 t=0,复位并开始采集
@@ -157,11 +157,12 @@ void loop() {
 
   // ---- 非阻塞发送:一次发一条,串口没空间就留在缓冲里下轮再发 ----
   if (tail != head) {
-    uint32_t t = ring[tail];
-    char line[24];
-    // 格式 "aa cccms":次数至少 2 位、时间至少 3 位,超出自动加宽
-    int n = snprintf(line, sizeof(line), "%02lu %03lums\n",
-                     (unsigned long)sendIdx, (unsigned long)t);
+    uint32_t t = ring[tail];                    // 单位 100µs
+    char line[32];
+    // 格式 "aa ccc.cms":次数至少 2 位,时间保留 1 位小数(0.1ms 分辨率)
+    int n = snprintf(line, sizeof(line), "%02lu %lu.%lums\n",
+                     (unsigned long)sendIdx,
+                     (unsigned long)(t / 10), (unsigned long)(t % 10));
     if (Serial.availableForWrite() >= n) {
       Serial.write((const uint8_t *)line, n);
       tail = (tail + 1) & (BUF_SIZE - 1);
