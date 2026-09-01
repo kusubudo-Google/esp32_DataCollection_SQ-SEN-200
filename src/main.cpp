@@ -3,12 +3,12 @@
 #include <time.h>
 #include <sys/time.h>
 
-#define FW_VERSION "ver3.03.00"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "ver3.04.00"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 27;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
 constexpr uint32_t LED_INTERVAL_MS = 500;
-constexpr int      SENSOR_PIN      = 33;    // 振动传感器输入(IO33,仅输入脚,OK)
+constexpr int      SENSOR_PIN      = 23;    // 振动传感器输入(IO23)
 constexpr uint32_t TICK_US         = 100;   // 时间计数器分辨率 = 0.1 ms(时间戳单位 = 100µs)
 constexpr uint32_t MIN_GAP_US      = 0;     // 去抖:两次下降沿最小间隔(µs),0 = 关闭
 constexpr uint32_t BUF_SIZE        = 4096;  // 环形缓冲记录数(必须是 2 的幂)
