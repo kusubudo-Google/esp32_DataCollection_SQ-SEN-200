@@ -9,6 +9,12 @@
 
 ---
 
+## Piezo VBR-Sen ver1.4.0 — 2026-09-07
+
+- 标定期间的调试打印加上时间戳:`YYYY-MM-DD HH:MM:SS  raw=... v=...V`
+- `ADC_IDLE_MARGIN_V`(0% 基线的安全余量)改成 5 档可选(`ADC_IDLE_MARGIN_LEVEL`,0~4),
+  范围 -0.001V(最灵敏)~ +0.005V(最保守,=原来的固定值),应对标定噪声实测为 0 的情况
+
 ## Piezo VBR-Sen ver1.3.2 — 2026-09-07
 
 - 心跳 LED 翻转周期从 0.5s 改为 **1s**(`LED_INTERVAL_MS` 500→1000)

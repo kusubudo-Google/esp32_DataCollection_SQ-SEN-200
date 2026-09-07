@@ -12,12 +12,14 @@
  * 3) 0% 基线标定:'s' 之后先连续采样 ADC_CAL_MS(10 s),统计均值 mean 和
  *    峰峰值噪声半幅 noiseAmp = (max-min)/2,
  *      threshold(0%) = mean - noiseAmp - ADC_IDLE_MARGIN_V
- *    电压 > threshold 都记为 0%(现场实测:mean≈3.188V,noiseAmp≈0.10V,
- *    ADC_IDLE_MARGIN_V=0.005V → threshold≈3.083V;noiseAmp 是标定时实测出来的,
- *    不是写死的值,所以噪声大小变化不用改代码)。
+ *    电压 > threshold 都记为 0%;noiseAmp 是标定时实测出来的,不是写死的值。
+ *    但 noiseAmp 有可能实测正好是 0(比如 ADC 顶到量程顶死不动,毫无波动),这时
+ *    ADC_IDLE_MARGIN_V 就是唯一的安全边界,所以做成 5 档可选(ADC_IDLE_MARGIN_LEVEL,
+ *    0~4),范围 -0.001V(最灵敏)~ +0.005V(最保守),见配置区 ADC_IDLE_MARGIN_TABLE。
  *    另设一个绝对期望值 ADC_NOMINAL_IDLE_V;若标定出的 mean 偏离它超过
- *    ADC_DRIFT_WARN_V(例:期望 3.18V,标定出 3.12V),判定为"可用但异常",
- *    通过串口发一行英文 WARNING 提示。
+ *    ADC_DRIFT_WARN_V(例:期望 3.13V,标定出 3.07V),判定为"可用但异常",
+ *    通过串口发英文 WARNING 提示(单独另起一行:第一行数值,第二行
+ *    "- still usable but check sensor/wiring")。
  * 4) 100% 基线:ADC 最低点不一定是 0V,固定 < ADC_LOW_FLOOR_V(100mV)记为
  *    100%;threshold(0%) 与 ADC_LOW_FLOOR_V 之间做线性映射得到 0~100%。
  * 5) 输出行格式 "ccc tt.ttttS a.aaV vvvv xx%"(例:04 23.2311S 2.21V 4012 23%):
@@ -43,7 +45,7 @@
  * 现在只有 IO32 这一路模拟通道。
  * ===================================================================== */
 
-#define FW_VERSION "Piezo VBR-Sen ver1.3.2"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "Piezo VBR-Sen ver1.4.0"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 23;    // 心跳 LED,1 s 翻转一次,用来判断 MCU 是否活着
@@ -63,7 +65,14 @@ constexpr uint32_t ADC_SAMPLE_US      = 400;     // 采样周期 400µs = 2.5kHz
                                                   // 400µs 离那条线还留 ~1.6 倍余量,300/400µs 均实测跑满
                                                   // 10s 标定无异常;以后再加别的每采样开销,务必重新实测
 constexpr uint32_t ADC_CAL_MS         = 10000;   // 's' 后先花 10s 标定"空闲高电平=0%"基线
-constexpr float    ADC_IDLE_MARGIN_V  = 0.005f;  // 0% 基线 = 标定均值 - 噪声半幅 - 该余量
+
+// 0% 基线 = 标定均值 - 噪声半幅 - ADC_IDLE_MARGIN_V。噪声半幅是标定时实测出来的,
+// 但如果实测噪声正好是 0(比如 ADC 顶到量程顶死不动),这个余量就成了唯一的安全边界,
+// 所以余量本身做成 5 档可选,从 -0.001V(阈值最灵敏,贴着均值,噪声=0 时几乎没有余量)
+// 到 +0.005V(阈值最保守,离均值最远)。改 ADC_IDLE_MARGIN_LEVEL(0~4)选档,重新烧录生效。
+constexpr float    ADC_IDLE_MARGIN_TABLE[5] = { -0.001f, 0.0005f, 0.002f, 0.0035f, 0.005f };
+constexpr int      ADC_IDLE_MARGIN_LEVEL    = 4;   // 0=最灵敏 -0.001V ... 4=最保守 +0.005V(默认档,等价于原来的固定值)
+constexpr float    ADC_IDLE_MARGIN_V  = ADC_IDLE_MARGIN_TABLE[ADC_IDLE_MARGIN_LEVEL];
 constexpr float    ADC_LOW_FLOOR_V    = 0.100f;  // 低于此电压(100mV)固定记为 100%
 constexpr float    ADC_NOMINAL_IDLE_V = 3.130f;  // 期望的空闲电压(现场实测值),标定值偏离它超过下面阈值就报警
 constexpr float    ADC_DRIFT_WARN_V   = 0.05f;   // 允许的漂移范围(V)
@@ -482,13 +491,15 @@ void loop() {
   // ---- IO32 模拟通道:非阻塞发送一条 "ccc tt.ttttS a.aaV vvvv xx%" ----
   sendAdcLine();
 
-  // ---- 校准调试打印:只在 10s 标定窗口内每 CAL_MONITOR_MS 打印一次 raw/电压(3 位小数),标定一结束就自动停 ----
+  // ---- 校准调试打印:只在 10s 标定窗口内每 CAL_MONITOR_MS 打印一次 时间+raw/电压(3 位小数),标定一结束就自动停 ----
   if (calMode && adcPhase == AdcPhase::CALIBRATING && nowMs - calMonitorLastMs >= CAL_MONITOR_MS) {
     calMonitorLastMs = nowMs;
     uint16_t mv = adcLastMillivolt;
-    char line[32];
-    snprintf(line, sizeof(line), "raw=%u v=%u.%03uV",
-             (unsigned)adcLastRaw, (unsigned)(mv / 1000), (unsigned)(mv % 1000));
+    char tbuf[24];
+    fmtNow(tbuf, sizeof(tbuf));      // 若时钟还没设过('cal' 不要求先设时钟),这里就是 1970 起算的默认时间
+    char line[56];
+    snprintf(line, sizeof(line), "%s  raw=%u v=%u.%03uV",
+             tbuf, (unsigned)adcLastRaw, (unsigned)(mv / 1000), (unsigned)(mv % 1000));
     Serial.println(line);
   }
 }
