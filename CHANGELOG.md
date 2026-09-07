@@ -1,7 +1,7 @@
 # 固件版本记录 (Firmware Changelog)
 
-版本号定义在 [src/main.cpp](src/main.cpp) 的 `FW_VERSION` 宏,格式 `verMAJOR.MINOR.PATCH`(两位数字)。
-`?` 命令和上电 banner 都会打印当前版本。每次改动固件行为时递增版本号并在此登记。
+版本号定义在 [src/main.cpp](src/main.cpp) 的 `FW_VERSION` 宏。`?` 命令和上电 banner 都会打印当前版本。
+每次改动固件行为时递增版本号并在此登记。
 
 - **MAJOR** — 不兼容的协议/命令/输出格式变更
 - **MINOR** — 新增命令或功能,向后兼容
@@ -9,7 +9,17 @@
 
 ---
 
-## ver3.08.01 — 2026-09-07
+## Piezo VBR-Sen ver1.0.0 — 2026-09-07
+
+- 产品/固件重新命名为 **Piezo VBR-Sen**,版本号从 `verMAJOR.MINOR.PATCH`(两位数字)方案
+  重置为 `verX.Y.Z`,标志着这是一个新的产品线(纯模拟振动检测,不再兼容旧的数字脉冲协议)
+- **完全移除 IO13 上的 SQ-SEN-200 数字振动传感器通道**(不再需要):`SENSOR_ENABLED`、
+  数字环形缓冲、`onFalling` 中断、`aa sss.ssss s` 输出行等相关代码全部删除,现在只剩
+  IO32 这一路 ADC 模拟通道
+- `r`/`R` 的回应文案同步改为 `counter reset (ccc=1, buffer cleared)`(不再提"pulse")
+- 心跳 LED 从 IO27 改到 **IO23**
+
+## ver3.08.01 — 2026-09-07(历史版本,SQ-SEN-200 数字通道仍在,已移除)
 
 - 修复 bug:新增的 raw 原始值需要额外读一次 ADC(analogRead),每次回调开销翻倍,
   之前的 200µs 默认值实机复测又触发 `task_wdt` 重启。重新二分法测出新硬上限在

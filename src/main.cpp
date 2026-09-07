@@ -7,7 +7,7 @@
  * 本节是 IO32 模拟振动检测功能的规格存档;以后这部分需求有变动,
  * 必须同步改这段注释,不要只改代码。
  *
- * 1) 串口发 's'/'S' 启动 ADC 采样(与数字通道共用同一个命令),满幅 0V~3.3V。
+ * 1) 串口发 's'/'S' 启动 ADC 采样,满幅 0V~3.3V。
  * 2) 空闲(无振动)= 高电平 → 定义为 0%;持续大振动 = 接近 0V → 定义为 100%。
  * 3) 0% 基线标定:'s' 之后先连续采样 ADC_CAL_MS(10 s),统计均值 mean 和
  *    峰峰值噪声半幅 noiseAmp = (max-min)/2,
@@ -38,19 +38,17 @@
  *
  * IO33 与 IO32 共用同一个传感器插头,现场已把 IO33 接到 GND,固件把它设为
  * 纯输入(不驱动、不加内部上拉),避免和外部 GND 对冲。
+ *
+ * 原来 IO13 上的 SQ-SEN-200 数字振动传感器通道已完全移除(不再需要),
+ * 现在只有 IO32 这一路模拟通道。
  * ===================================================================== */
 
-#define FW_VERSION "ver3.08.01"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "Piezo VBR-Sen ver1.0.0"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
-#define SENSOR_ENABLED 0             // IO13 振动检测开关:1=正常挂中断采集,0=禁用中断(仅内部上拉,不响应任何脉冲)
-                                      // 现场 IO13 悬空/未接传感器时设为 0,接好传感器后改回 1 即可恢复采集
-constexpr int      LED_PIN         = 27;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
+constexpr int      LED_PIN         = 23;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
 constexpr uint32_t LED_INTERVAL_MS = 500;
-constexpr int      SENSOR_PIN      = 13;    // 振动传感器输入(IO13)
 constexpr uint32_t TICK_US         = 100;   // 时间计数器分辨率 = 0.1 ms(时间戳单位 = 100µs)
-constexpr uint32_t MIN_GAP_US      = 0;     // 去抖:两次下降沿最小间隔(µs),0 = 关闭
-constexpr uint32_t BUF_SIZE        = 4096;  // 环形缓冲记录数(必须是 2 的幂)
 constexpr uint32_t TX_BUF_BYTES    = 2048;  // 串口发送软缓冲
 
 // ---------------- ADC 模拟振动通道配置(IO32) ----------------
@@ -70,79 +68,19 @@ constexpr float    ADC_NOMINAL_IDLE_V = 3.188f;  // 期望的空闲电压(现场
 constexpr float    ADC_DRIFT_WARN_V   = 0.05f;   // 允许的漂移范围(V)
 constexpr uint32_t ADC_BUF_SIZE       = 2048;    // ADC 事件发送环形缓冲(2 的幂),吸收一次振动事件的突发采样
 
-// ---------------- 环形缓冲(单生产者 ISR / 单消费者 loop,无需加锁) ----------------
-// 只存"距所在整分的偏移"(单位 100µs,0~599999),次数由发送端自己数
-static uint32_t ring[BUF_SIZE];
-static volatile uint32_t head = 0;        // ISR 写
-static volatile uint32_t tail = 0;        // loop 读
-static volatile uint32_t dropped = 0;     // 缓冲满导致的丢失计数(正常应为 0)
-static volatile uint32_t pulseCount = 0;  // ISR 侧总脉冲数(含被丢弃的),仅诊断用
-
-static volatile bool    started       = false;  // true 表示已收到 's',正在采集
-static volatile int64_t anchorEspUs   = 0;      // 锚点:esp_timer 读数
-static volatile int64_t anchorEpochUs = 0;      // 锚点:同一时刻的墙上时间(µs since epoch)
-static volatile uint32_t lastEdgeUs   = 0;
-static bool detached    = false;
-static bool isrAttached = false;
-static uint32_t sendIdx = 1;              // 发送端计数(= 输出里的 aa,从 1 开始),只有 loop 碰
-
 static bool timeIsSet    = false;  // 是否已用 'T' 命令设过墙上时间
 static long lastTimeMin  = -1;     // 上次播报的"墙上分钟号"(epoch/60),用于整分触发一次
 
-// 记录 esp_timer 与墙上时间的对应关系,ISR 靠它推算每个脉冲的绝对时刻
+static volatile int64_t anchorEspUs   = 0;      // 锚点:esp_timer 读数
+static volatile int64_t anchorEpochUs = 0;      // 锚点:同一时刻的墙上时间(µs since epoch)
+
+// 记录 esp_timer 与墙上时间的对应关系,ADC 定时器回调靠它推算每个采样的绝对时刻
 void captureAnchor() {
   int64_t esp = esp_timer_get_time();
   struct timeval tv;
   gettimeofday(&tv, NULL);
   anchorEspUs   = esp;
   anchorEpochUs = (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec;
-}
-
-void IRAM_ATTR onFalling() {
-  if (!started) return;                              // 's' 之前的脉冲忽略
-
-  int64_t now = esp_timer_get_time();
-  uint32_t us = (uint32_t)now;
-  if (MIN_GAP_US && (us - lastEdgeUs) < MIN_GAP_US) { lastEdgeUs = us; return; }
-  lastEdgeUs = us;
-
-  pulseCount++;
-  int64_t epochUs = anchorEpochUs + (now - anchorEspUs);       // 该脉冲的绝对时刻(µs)
-  uint32_t t = (uint32_t)((epochUs % 60000000LL) / TICK_US);   // 距所在整分的偏移(单位 TICK_US)
-
-  uint32_t next = (head + 1) & (BUF_SIZE - 1);
-  if (next == tail) {
-    dropped++;                                       // 缓冲满,丢弃
-  } else {
-    ring[head] = t;
-    head = next;
-  }
-}
-
-// 统一的中断挂载入口:SENSOR_ENABLED=0 时永远不真正挂中断,isrAttached 也保持 false,
-// 这样所有依赖 isrAttached 的分支(setTimeCmd/zeroCounters/stopSensing)都会自动走"不碰中断"的路径
-void sensorAttachInterrupt() {
-#if SENSOR_ENABLED
-  attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onFalling, FALLING);
-  isrAttached = true;
-#else
-  isrAttached = false;
-#endif
-}
-
-// 只清空缓冲和计数(不动时间锚点)
-void clearBuffer() {
-  head = tail = 0;
-  dropped = 0;
-  pulseCount = 0;
-  sendIdx = 1;                                       // aa 从 1 开始
-  lastEdgeUs = (uint32_t)esp_timer_get_time();
-}
-
-// clearBuffer + 刷新时间锚点(用于 's' 开始采集)
-void resetState() {
-  clearBuffer();
-  captureAnchor();
 }
 
 // ---------------- ADC 模拟振动通道(IO32,esp_timer 定时采样,单独一套环形缓冲) ----------------
@@ -225,7 +163,7 @@ void adcTimerCallback(void *) {
 
   if (pct > 1) {                                          // 只有 >1% 才算一次事件,进缓冲等待发送
     int64_t now = esp_timer_get_time();
-    int64_t epochUs = anchorEpochUs + (now - anchorEspUs); // 复用数字通道同一套时钟锚点
+    int64_t epochUs = anchorEpochUs + (now - anchorEspUs); // 用同一套时钟锚点换算绝对时刻
     uint32_t t = (uint32_t)((epochUs % 60000000LL) / TICK_US);
 
     uint32_t next = (adcHead + 1) & (ADC_BUF_SIZE - 1);
@@ -311,7 +249,7 @@ void fmtNow(char *out, size_t n) {
   strftime(out, n, "%Y-%m-%d %H:%M:%S", &tm);
 }
 
-// 把 epoch 秒向下取整到整分,格式化成 "YYYY-MM-DD HH:MM:00"(脉冲偏移的基准)
+// 把 epoch 秒向下取整到整分,格式化成 "YYYY-MM-DD HH:MM:00"(采样偏移的基准)
 void fmtMinute(char *out, size_t n, time_t t) {
   time_t m = (t / 60) * 60;
   struct tm tm;
@@ -359,14 +297,11 @@ void setTimeCmd(const char *s) {
   timeIsSet = true;
   lastTimeMin = (long)(epoch / 60);           // 当前这一分钟不补播,下一整分才播
 
-  // 刷新 ISR 用的时间锚点;若正在采集,短暂 detach 避免 64 位撕裂读
-  if (started && isrAttached) {
-    detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
-    captureAnchor();
-    sensorAttachInterrupt();
-  } else {
-    captureAnchor();
-  }
+  // 刷新 ADC 用的时间锚点;若正在标定/采集,短暂停一下定时器,避免和回调撞上导致 64 位撕裂读
+  bool adcRunning = (adcPhase != AdcPhase::IDLE);
+  if (adcRunning && adcTimer) esp_timer_stop(adcTimer);
+  captureAnchor();
+  if (adcRunning) esp_timer_start_periodic(adcTimer, ADC_SAMPLE_US);
 
   char buf[24];
   fmtNow(buf, sizeof(buf));
@@ -374,39 +309,26 @@ void setTimeCmd(const char *s) {
   Serial.println(buf);
 }
 
-// 收到 's'/'S':复位并开始采集(必须先设时钟)。脉冲偏移以"所在整分"为基准
+// 收到 's'/'S':刷新时间锚点并开始采集(必须先设时钟)。采样偏移以"所在整分"为基准
 void startSensing() {
   if (!timeIsSet) {
     Serial.println("clock not set, send 'T YYYYMMDD HHMMSS' before 's'");
     return;
   }
-  if (isrAttached) detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
-  resetState();
-  detached = false;
-  started = true;
-  sensorAttachInterrupt();
+  captureAnchor();
 
   char buf[24];
   fmtNow(buf, sizeof(buf));
   Serial.print("start @ ");
   Serial.println(buf);            // 's' 的确切时刻;基准 = 向下取整到整分
-#if !SENSOR_ENABLED
-  Serial.println("note: IO13 sensing DISABLED (SENSOR_ENABLED=0), no pulses will be captured");
-#endif
-  adcStartCalibration();          // 同一个 's' 顺带启动 IO32 模拟通道的标定+采样
+
+  adcStartCalibration();          // 启动 IO32 模拟通道的标定+采样
 }
 
-// 收到 'r'/'R':只复位脉冲计数 + 清空缓冲(不动时钟/时间基准),保持当前启停状态
+// 收到 'r'/'R':只复位事件计数 + 清空缓冲(不动时钟/时间基准/标定),保持当前启停状态
 void zeroCounters() {
-  if (started && isrAttached) {
-    detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));   // 清缓冲期间挡住 ISR
-    clearBuffer();
-    sensorAttachInterrupt();
-  } else {
-    clearBuffer();
-  }
-  adcResetRuntime();             // ADC 事件计数/缓冲同步复位(不重新标定)
-  Serial.print("pulse counter reset (aa=1, buffer cleared)");
+  adcResetRuntime();
+  Serial.print("counter reset (ccc=1, buffer cleared)");
   if (timeIsSet) {
     char buf[24];
     fmtNow(buf, sizeof(buf));
@@ -418,32 +340,25 @@ void zeroCounters() {
 
 // 收到 'p'/'P':立即停止采集(缓冲里已有的会继续发完)
 void stopSensing() {
-  started = false;
-  if (isrAttached && !detached) {
-    detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
-    detached = true;
-    isrAttached = false;
-  }
   adcStop();
   Serial.println("stopped by command");
 }
 
 void printHelp() {
-  Serial.println("SQ-SEN-200 vibration logger  " FW_VERSION);
+  Serial.println(FW_VERSION);
   Serial.println("commands:");
   Serial.println("  s/S   - start sensing (clock must be set first)");
-  Serial.println("  p/P   - stop sensing (buffered pulses keep flushing)");
-  Serial.println("  r/R   - reset pulse counter (aa=1, clear buffer) + show time; clock untouched");
+  Serial.println("  p/P   - stop sensing (buffered samples keep flushing)");
+  Serial.println("  r/R   - reset counter (ccc=1, clear buffer) + show time; clock untouched");
   Serial.println("  T ... - set clock: T YYYYMMDD HHMMSS  (e.g. T 20260827 140000)");
   Serial.println("  time  - print current clock (or 'not set')");
   Serial.println("  ping  - reply 'pong'");
   Serial.println("  ?     - print this list + current state");
-  Serial.println("pulse line: 'aa sss.ssss s' = offset from the preceding 'time: HH:MM:00' base");
-  Serial.println("adc line:   'ccc tt.ttttS a.aaV vvvv xx%' = IO32 sample >1% (a.aaV/vvvv=voltage/raw for reference, xx%=amplitude)");
+  Serial.println("adc line: 'ccc tt.ttttS a.aaV vvvv xx%' = IO32 sample >1% (a.aaV/vvvv=voltage/raw for reference, xx%=amplitude)");
   Serial.println("'time:' base prints at each whole minute (sensing or not), ends with current adc voltage/raw/amplitude");
 
   Serial.print("state: ");
-  Serial.println(started ? "sensing" : "stopped");
+  Serial.println(adcPhase == AdcPhase::IDLE ? "stopped" : "sensing");
   if (timeIsSet) {
     char buf[24];
     fmtNow(buf, sizeof(buf));
@@ -510,18 +425,11 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  pinMode(SENSOR_PIN, INPUT_PULLUP);                 // IO13 当前悬空/传感器未接,开内部上拉防止误触发
-  sensorAttachInterrupt();
-  started = false;                                   // 等 's'/'S' 才开始计时
-#if SENSOR_ENABLED
-  Serial.println("ready, send 's' to start ('?' for help)");
-#else
-  Serial.println("IO13 sensing DISABLED (SENSOR_ENABLED=0, pull-up only) - edit SENSOR_ENABLED and reflash to re-enable");
-#endif
-
   pinMode(ADC_GND_GUARD_PIN, INPUT);                 // IO33 现场接了 GND,纯输入,不驱动/不上拉,避免和地线对冲
   analogReadResolution(12);                          // 0~4095
   analogSetPinAttenuation(ADC_PIN, ADC_11db);         // 满幅覆盖 0~3.3V
+
+  Serial.println("ready, send 's' to start ('?' for help)");
 }
 
 void loop() {
@@ -535,32 +443,17 @@ void loop() {
     digitalWrite(LED_PIN, ledState);
   }
 
-  // ---- 处理来自串口的命令(s / p / r / T / ping) ----
+  // ---- 处理来自串口的命令(s / p / r / T / time / ping / ?) ----
   // 采集只在收到 'p'/'P' 时停止,没有自动停止
   pollSerialInput();
 
   // ---- 每到墙上时钟整分播报一次基准时间(需已设时钟;是否在采集都播报) ----
-  // 这一行是后续脉冲偏移的基准:pulse 绝对时刻 = 上一条 time: 的整分 + "sss.ssss s"
-  // 仅在两路发送缓冲都已清空时播报,保证上一分钟的脉冲/ADC 事件都排在这行之前
-  if (timeIsSet && tail == head && adcTail == adcHead && (long)(time(NULL) / 60) != lastTimeMin) {
+  // 这一行是后续 ADC 事件偏移的基准:事件绝对时刻 = 上一条 time: 的整分 + "sss.ssss S"
+  // 仅在发送缓冲已清空时播报,保证上一分钟的事件都排在这行之前
+  if (timeIsSet && adcTail == adcHead && (long)(time(NULL) / 60) != lastTimeMin) {
     emitTimeBase();
   }
 
-  // ---- 非阻塞发送:一次发一条,串口没空间就留在缓冲里下轮再发 ----
-  if (tail != head) {
-    uint32_t t = ring[tail];                    // 距所在整分的偏移,单位 100µs(0~599999)
-    char line[32];
-    // 格式 "aa sss.ssss s":次数至少 2 位,偏移 = 距最近 time: 的秒数,保留 4 位小数(0.1ms)
-    int n = snprintf(line, sizeof(line), "%02lu %lu.%04lu s\n",
-                     (unsigned long)sendIdx,
-                     (unsigned long)(t / 10000), (unsigned long)(t % 10000));
-    if (Serial.availableForWrite() >= n) {
-      Serial.write((const uint8_t *)line, n);
-      tail = (tail + 1) & (BUF_SIZE - 1);
-      sendIdx++;
-    }
-  }
-
-  // ---- IO32 模拟通道:非阻塞发送一条 "ccc tt.ttttS xx%" ----
+  // ---- IO32 模拟通道:非阻塞发送一条 "ccc tt.ttttS a.aaV vvvv xx%" ----
   sendAdcLine();
 }
