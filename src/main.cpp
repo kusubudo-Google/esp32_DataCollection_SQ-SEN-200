@@ -43,7 +43,7 @@
  * 现在只有 IO32 这一路模拟通道。
  * ===================================================================== */
 
-#define FW_VERSION "Piezo VBR-Sen ver1.2.0"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "Piezo VBR-Sen ver1.2.1"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 23;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
@@ -276,7 +276,7 @@ void emitTimeBase() {
            (unsigned)adcLastRaw, (unsigned)adcLastPct);
   Serial.print("time: ");
   Serial.print(buf);
-  Serial.println(tail);
+  Serial.println(tail); 
 }
 
 // 收到 'T YYYYMMDD HHMMSS':设定墙上时间
@@ -315,8 +315,8 @@ void setTimeCmd(const char *s) {
   Serial.println(buf);
 }
 
-// 收到 'cal' 或开机自检:纯校准调试模式,不需要先设时钟。做一次 10s 的 0% 标定,
-// 期间和之后都由 loop() 周期打印 raw/电压(见 CAL_MONITOR_MS),直到 's' 或 'p' 打断
+// 收到 'cal':纯校准调试模式,不需要先设时钟。做一次 10s 的 0% 标定,期间由 loop()
+// 周期打印 raw/电压(见 CAL_MONITOR_MS);标定一结束(转入 RUNNING)打印自动停止
 void startCalMonitor() {
   calMode = true;
   calMonitorLastMs = 0;
@@ -368,7 +368,7 @@ void printHelp() {
   Serial.println("  r/R   - reset counter (ccc=1, clear buffer) + show time; clock untouched");
   Serial.println("  T ... - set clock: T YYYYMMDD HHMMSS  (e.g. T 20260827 140000)");
   Serial.println("  <space> - test shortcut: set clock to 2026-09-09 09:00:00");
-  Serial.println("  cal   - debug: 10s zero-level calibration, then keep printing raw/voltage until 's'/'p'");
+  Serial.println("  cal   - debug: 10s zero-level calibration, prints raw/voltage only during that 10s window");
   Serial.println("  time  - print current clock (or 'not set')");
   Serial.println("  ping  - reply 'pong'");
   Serial.println("  ?     - print this list + current state");
@@ -450,8 +450,6 @@ void setup() {
   analogSetPinAttenuation(ADC_PIN, ADC_11db);         // 满幅覆盖 0~3.3V
 
   Serial.println("ready, send 's' to start ('?' for help)");
-
-  startCalMonitor();                                  // 开机自检:自动做一次 10s 0% 标定并持续打印 raw/电压
 }
 
 void loop() {
@@ -479,8 +477,8 @@ void loop() {
   // ---- IO32 模拟通道:非阻塞发送一条 "ccc tt.ttttS a.aaV vvvv xx%" ----
   sendAdcLine();
 
-  // ---- 'cal' 调试模式:每 CAL_MONITOR_MS 打印一次当前 raw/电压,标定期间和之后都打印,直到 's'/'p' ----
-  if (calMode && nowMs - calMonitorLastMs >= CAL_MONITOR_MS) {
+  // ---- 'cal' 调试模式:只在 10s 标定窗口内每 CAL_MONITOR_MS 打印一次 raw/电压,标定一结束就自动停 ----
+  if (calMode && adcPhase == AdcPhase::CALIBRATING && nowMs - calMonitorLastMs >= CAL_MONITOR_MS) {
     calMonitorLastMs = nowMs;
     uint16_t cv = adcLastCentivolt;
     char line[32];
