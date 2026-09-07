@@ -12,8 +12,9 @@
  * 3) 0% 基线标定:'s' 之后先连续采样 ADC_CAL_MS(10 s),统计均值 mean 和
  *    峰峰值噪声半幅 noiseAmp = (max-min)/2,
  *      threshold(0%) = mean - noiseAmp - ADC_IDLE_MARGIN_V
- *    电压 > threshold 都记为 0%(例:mean=3.18V,noiseAmp=0.02V,
- *    ADC_IDLE_MARGIN_V=0.005V → threshold=3.155V)。
+ *    电压 > threshold 都记为 0%(现场实测:mean≈3.188V,noiseAmp≈0.10V,
+ *    ADC_IDLE_MARGIN_V=0.005V → threshold≈3.083V;noiseAmp 是标定时实测出来的,
+ *    不是写死的值,所以噪声大小变化不用改代码)。
  *    另设一个绝对期望值 ADC_NOMINAL_IDLE_V;若标定出的 mean 偏离它超过
  *    ADC_DRIFT_WARN_V(例:期望 3.18V,标定出 3.12V),判定为"可用但异常",
  *    通过串口发一行英文 WARNING 提示。
@@ -24,9 +25,10 @@
  *      tt.ttttS = 距最近一条 "time:" 整分基准的秒偏移,4 位小数(0.1ms 分辨率)+ 'S'
  *      xx%      = 该次采样幅度百分比(0~100,四舍五入取整)
  *    只有幅度 > 1% 的采样才输出一行,采样率越高、脉冲越宽,输出行数越多
- *    (例:采样周期 50µs、脉冲 >1% 宽度 400µs → 理论应输出 8 行;但实测 esp_timer
- *    在 100µs/10kHz 会把 CPU 占满触发看门狗重启,已改为 1kHz 默认值,见 ADC_SAMPLE_US
- *    的注释)。空闲(≤1%)不输出,不占用串口带宽。
+ *    (例:采样周期 50µs、脉冲 >1% 宽度 400µs → 理论应输出 8 行;但实机二分法测出
+ *    esp_timer 硬上限在 120~135µs 之间,超过就必炸 task_wdt 重启,50µs 不可行,
+ *    默认改用留有余量的 200µs/5kHz,见 ADC_SAMPLE_US 的注释)。空闲(≤1%)不输出,
+ *    不占用串口带宽。
  * 6) 'T' 设置时钟、每整分播报一次 "time: ..." 的逻辑不变;只在这行末尾追加
  *    当前(最新一次采样)的幅度百分比,例如 "time: 2026-09-07 14:23:00 0%"。
  *
@@ -34,7 +36,7 @@
  * 纯输入(不驱动、不加内部上拉),避免和外部 GND 对冲。
  * ===================================================================== */
 
-#define FW_VERSION "ver3.07.01"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "ver3.07.02"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 #define SENSOR_ENABLED 0             // IO13 振动检测开关:1=正常挂中断采集,0=禁用中断(仅内部上拉,不响应任何脉冲)
@@ -50,14 +52,16 @@ constexpr uint32_t TX_BUF_BYTES    = 2048;  // 串口发送软缓冲
 // ---------------- ADC 模拟振动通道配置(IO32) ----------------
 constexpr int      ADC_PIN            = 32;      // 模拟振动传感器输入(IO32, ADC1_CH4)
 constexpr int      ADC_GND_GUARD_PIN  = 33;      // 现场接了 GND 的邻脚(同一插头),只设输入,不驱动/不上拉
-constexpr uint32_t ADC_SAMPLE_US      = 1000;    // 采样周期 1ms = 1kHz。esp_timer 的回调跑在专用任务里,
-                                                  // 实测 100µs(10kHz)会把该任务所在核心的 CPU 占满,
-                                                  // IDLE 任务喂不上看门狗,10s 标定期间必炸 task_wdt 重启;
-                                                  // 1kHz 每次回调后留出足够空闲时间,不会再触发看门狗
+constexpr uint32_t ADC_SAMPLE_US      = 200;     // 采样周期 200µs = 5kHz。esp_timer 回调跑在专用任务里,
+                                                  // 实机二分法测过硬上限:100/120µs 必炸 task_wdt(CPU 被
+                                                  // 占满,IDLE0 喂不上看门狗),135µs 起才稳,即硬上限在
+                                                  // 120~135µs(约 7.4~8.3kHz)之间,且卡得很死、没有余量。
+                                                  // 5kHz 离那条线还有 ~1.5 倍余量,200/250/500µs/1kHz 都
+                                                  // 实测跑满 10s 标定无异常,可按需在这几档之间调整
 constexpr uint32_t ADC_CAL_MS         = 10000;   // 's' 后先花 10s 标定"空闲高电平=0%"基线
 constexpr float    ADC_IDLE_MARGIN_V  = 0.005f;  // 0% 基线 = 标定均值 - 噪声半幅 - 该余量
 constexpr float    ADC_LOW_FLOOR_V    = 0.100f;  // 低于此电压(100mV)固定记为 100%
-constexpr float    ADC_NOMINAL_IDLE_V = 3.18f;   // 期望的空闲电压(按现场实测调整),标定值偏离它超过下面阈值就报警
+constexpr float    ADC_NOMINAL_IDLE_V = 3.188f;  // 期望的空闲电压(现场实测值),标定值偏离它超过下面阈值就报警
 constexpr float    ADC_DRIFT_WARN_V   = 0.05f;   // 允许的漂移范围(V)
 constexpr uint32_t ADC_BUF_SIZE       = 2048;    // ADC 事件发送环形缓冲(2 的幂),吸收一次振动事件的突发采样
 
