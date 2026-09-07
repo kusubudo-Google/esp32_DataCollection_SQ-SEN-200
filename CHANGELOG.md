@@ -9,6 +9,21 @@
 
 ---
 
+## Piezo VBR-Sen ver1.8.1 — 2026-09-07
+
+- 修复 bug:标定调试打印偶尔在第一行就打出 `raw=0 v=0.000V`——`calMonitorLastMs` 是在
+  `startSensing`/`startCalMonitor` 里用一次新的 `millis()` 设的,可能比同一轮 `loop()`
+  开头取的 `nowMs` 还晚一点点,无符号减法下溢导致立刻误触发一次打印。改成有符号比较
+
+## Piezo VBR-Sen ver1.8.0 — 2026-09-07
+
+- 振动指示灯改成硬件定时器驱动,不再经过 `loop()` 轮询,做到尽量实时:
+  `adcTimerCallback` 检测到 >1% 就直接 `digitalWrite(HIGH)`,并用一个独立的一次性
+  `esp_timer`(`ledOffTimer`)在 `pct*LED_EVENT_US_PER_PCT` 微秒后精确关灯;期间
+  新样本只要还 >1% 就重新定时续时,不会被更短的后续样本提前关掉
+- 实机压测:临时强制每次采样都判定为事件(90%,持续 20s、约 9100+ 次连续触发),
+  验证这条从未被真实振动触发过的分支不会突破之前测出的看门狗余量,测完已移除压测代码
+
 ## Piezo VBR-Sen ver1.7.1 — 2026-09-07
 
 - 振动指示灯的点亮时长从"100% → 500ms"改为"100% → 1ms"。millis() 的 1ms 整数分辨率

@@ -42,9 +42,11 @@
  *    当前(最新一次采样)的电压/原始值/幅度,例如
  *    "time: 2026-09-07 14:23:00 3.19V 3958 0%"。
  * 7) 心跳 LED(LED_PIN)保持 1s 翻转不变;检测到振动(>1%)时同一颗 LED 会被强制
- *    点亮一段时间(不打断心跳节奏,只是暂时盖过它的输出),点亮时长正比于幅度:
- *    duration_us = pct * LED_EVENT_US_PER_PCT(默认每 1% 对应 10µs,100% → 1ms),
- *    用 esp_timer 的 µs 时间戳判断而不是 millis(),因为 1ms 级的时长 millis() 分不出档位。
+ *    点亮(不打断心跳节奏,只是暂时盖过它的输出),要求尽量实时,所以不经过 loop()
+ *    轮询——直接在 adcTimerCallback 里 digitalWrite(HIGH),并用一个独立的一次性
+ *    esp_timer(ledOffTimer)在 pct*LED_EVENT_US_PER_PCT 微秒后精确关灯(默认每 1%
+ *    对应 10µs,100% → 1ms);期间只要还有新样本 >1%,就重新定时(相当于续时,
+ *    不会中途被更短的新样本提前关掉)。
  *
  * IO33 与 IO32 共用同一个传感器插头,现场已把 IO33 接到 GND,固件把它设为
  * 纯输入(不驱动、不加内部上拉),避免和外部 GND 对冲。
@@ -53,7 +55,7 @@
  * 现在只有 IO32 这一路模拟通道。
  * ===================================================================== */
 
-#define FW_VERSION "Piezo VBR-Sen ver1.7.1"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "Piezo VBR-Sen ver1.8.1"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 23;    // 心跳 LED,1 s 翻转一次,用来判断 MCU 是否活着;
@@ -123,11 +125,19 @@ static volatile uint16_t adcLastRaw      = 0;    // 最新一次采样的原始 
 static volatile uint16_t adcLastCentivolt = 0;   // 最新一次采样的电压*100,2 位小数(供事件行/time: 行用)
 static volatile uint16_t adcLastMillivolt = 0;   // 最新一次采样的电压*1000,3 位小数(供 'cal' 调试打印用)
 
-// 振动指示灯:>1% 的采样会把这个时间戳(esp_timer µs)往后推(只延长、不缩短),loop() 里
-// 拿它和 esp_timer_get_time() 比较,没过期就强制点亮 LED_PIN,过期了就交回心跳控制。
-// 用 µs 而不是 millis() 是因为 100% 也才 1ms,millis() 的 1ms 整数分辨率根本分不出档位。
-// timer 回调(另一个任务)写,loop() 读,故用 volatile。
-static volatile int64_t ledEventOffAtUs = 0;
+// 振动指示灯:硬件定时器驱动,不经过 loop() 轮询,做到尽量实时。
+// adcTimerCallback 检测到 >1% 就直接 digitalWrite(HIGH),同时用一个独立的一次性
+// esp_timer(ledOffTimer)在 pct*LED_EVENT_US_PER_PCT 微秒后精确关灯;期间新样本
+// 只要还 >1% 就重新定时(相当于"续命"),灯就一直亮到最后一次达标采样对应的时长结束。
+static volatile bool heartbeatLedState = false;  // 心跳"此刻应该"是什么电平,loop() 按 1s 周期翻转
+static volatile bool ledForcedOn      = false;   // true = 正被振动强制点亮,loop() 心跳翻转时不要碰引脚
+static esp_timer_handle_t ledOffTimer = nullptr;
+
+// ledOffTimer 到点回调:交还心跳控制权
+void ledOffTimerCallback(void *) {
+  ledForcedOn = false;
+  digitalWrite(LED_PIN, heartbeatLedState);
+}
 
 static esp_timer_handle_t adcTimer = nullptr;
 static int64_t  adcCalStartUs = 0;
@@ -229,8 +239,12 @@ void adcTimerCallback(void *) {
   if (pct > 1) {                                          // 只有 >1% 才算一次事件,进缓冲等待发送
     int64_t now = esp_timer_get_time();
 
-    int64_t offAt = now + (int64_t)pct * LED_EVENT_US_PER_PCT;  // 幅度越大,LED 保持点亮越久(µs 级)
-    if (offAt > ledEventOffAtUs) ledEventOffAtUs = offAt;        // 只延长,不缩短
+    if (!ledForcedOn) {                                    // 振动指示灯:硬件定时器驱动,实时点亮/续时
+      ledForcedOn = true;
+      digitalWrite(LED_PIN, HIGH);
+    }
+    esp_timer_stop(ledOffTimer);                            // 忽略返回值:没在跑也没关系
+    esp_timer_start_once(ledOffTimer, (uint64_t)pct * LED_EVENT_US_PER_PCT);  // 幅度越大续时越久
 
     int64_t epochUs = anchorEpochUs + (now - anchorEspUs); // 用同一套时钟锚点换算绝对时刻
     uint32_t t = (uint32_t)((epochUs % 60000000LL) / TICK_US);
@@ -527,6 +541,12 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
+  esp_timer_create_args_t ledOffArgs = {};           // 振动指示灯的"到点关灯"一次性定时器
+  ledOffArgs.callback = &ledOffTimerCallback;
+  ledOffArgs.dispatch_method = ESP_TIMER_TASK;
+  ledOffArgs.name = "led_off";
+  esp_timer_create(&ledOffArgs, &ledOffTimer);
+
   pinMode(ADC_GND_GUARD_PIN, INPUT);                 // IO33 现场接了 GND,纯输入,不驱动/不上拉,避免和地线对冲
   analogReadResolution(12);                          // 0~4095
   analogSetPinAttenuation(ADC_PIN, ADC_11db);         // 满幅覆盖 0~3.3V
@@ -536,18 +556,15 @@ void setup() {
 
 void loop() {
   // ---- 心跳 LED:每 1s 翻转一次,loop 一旦卡住心跳就会停 ----
-  // 振动(>1%)时同一颗 LED 会被强制点亮(见 ledEventOffAtUs,由 ADC 定时器回调更新,µs 级),
-  // 时长跟幅度成正比;这里只决定"心跳本身该是什么状态",不影响下面的强制点亮判断,
-  // 所以振动指示灯亮完之后,心跳节奏一点没乱,接着原来的相位继续跳。
+  // 振动指示灯改成硬件定时器驱动(见 adcTimerCallback/ledOffTimerCallback),不经过这里轮询;
+  // 振动强制点亮期间(ledForcedOn)心跳只更新状态、不去碰引脚,等 ledOffTimer 到点自动交还控制权。
   static uint32_t ledLast = 0;
-  static bool ledState = false;
   uint32_t nowMs = millis();
   if (nowMs - ledLast >= LED_INTERVAL_MS) {
     ledLast = nowMs;
-    ledState = !ledState;
+    heartbeatLedState = !heartbeatLedState;
+    if (!ledForcedOn) digitalWrite(LED_PIN, heartbeatLedState);
   }
-  bool ledVibrationHold = ledEventOffAtUs > esp_timer_get_time();
-  digitalWrite(LED_PIN, ledVibrationHold ? HIGH : ledState);
 
   // ---- 处理来自串口的命令(s / p / r / T / time / ping / ?) ----
   // 采集只在收到 'p'/'P' 时停止,没有自动停止
@@ -564,7 +581,9 @@ void loop() {
   sendAdcLine();
 
   // ---- 校准调试打印:只在 10s 标定窗口内每 CAL_MONITOR_MS 打印一次 时间+raw/电压(3 位小数),标定一结束就自动停 ----
-  if (calMode && adcPhase == AdcPhase::CALIBRATING && nowMs - calMonitorLastMs >= CAL_MONITOR_MS) {
+  // 用有符号比较:calMonitorLastMs 是在这次 loop 更靠后的地方(startSensing/startCalMonitor)
+  // 用一次新的 millis() 设的,可能比这里最上面取的 nowMs 还晚一点点,无符号减法会下溢立刻触发一次误打印
+  if (calMode && adcPhase == AdcPhase::CALIBRATING && (int32_t)(nowMs - calMonitorLastMs) >= (int32_t)CAL_MONITOR_MS) {
     calMonitorLastMs = nowMs;
     uint16_t mv = adcLastMillivolt;
     char tbuf[24];
