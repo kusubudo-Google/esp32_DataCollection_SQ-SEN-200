@@ -9,6 +9,11 @@
 
 ---
 
+## Piezo VBR-Sen ver1.1.0 — 2026-09-07
+
+- 新增测试快捷键:串口发一个空格(单独一行 " ")就等同于 `T 20260909 090000`,
+  测试时不用每次手动敲完整的 `T YYYYMMDD HHMMSS` 命令
+
 ## Piezo VBR-Sen ver1.0.1 — 2026-09-07
 
 - 修复 bug:标定期间(10s)`time:` 行末尾一直显示 `0.00V 0 0%`,是因为 `adcLastRaw/adcLastCentivolt`

@@ -43,7 +43,7 @@
  * 现在只有 IO32 这一路模拟通道。
  * ===================================================================== */
 
-#define FW_VERSION "Piezo VBR-Sen ver1.0.1"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "Piezo VBR-Sen ver1.1.0"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 23;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
@@ -353,6 +353,7 @@ void printHelp() {
   Serial.println("  p/P   - stop sensing (buffered samples keep flushing)");
   Serial.println("  r/R   - reset counter (ccc=1, clear buffer) + show time; clock untouched");
   Serial.println("  T ... - set clock: T YYYYMMDD HHMMSS  (e.g. T 20260827 140000)");
+  Serial.println("  <space> - test shortcut: set clock to 2026-09-09 09:00:00");
   Serial.println("  time  - print current clock (or 'not set')");
   Serial.println("  ping  - reply 'pong'");
   Serial.println("  ?     - print this list + current state");
@@ -399,6 +400,7 @@ void handleCmd(const char *s) {
       Serial.println("clock not set, send 'T YYYYMMDD HHMMSS'");
     }
   }
+  else if (!strcmp(s, " ")) setTimeCmd("T 20260909 090000");  // 测试快捷键:空格 = 快速设成 2026-09-09 09:00:00
   else if (!strcmp(s, "?"))                    printHelp();
   else if (!strcmp(s, "ping"))                 Serial.println("pong");
   else if (s[0] != '\0') { Serial.print("unknown cmd: "); Serial.println(s); }
