@@ -10,15 +10,20 @@
  * 1) 串口发 's'/'S' 启动 ADC 采样,满幅 0V~3.3V。
  * 2) 空闲(无振动)= 高电平 → 定义为 0%;持续大振动 = 接近 0V → 定义为 100%。
  * 3) 0% 基线标定:'s' 之后先连续采样 ADC_CAL_MS(10 s),统计均值 mean 和
- *    峰峰值噪声半幅 noiseAmp = (max-min)/2,
- *      threshold(0%) = mean - noiseAmp - ADC_IDLE_MARGIN_V
- *    电压 > threshold 都记为 0%;noiseAmp 是标定时实测出来的,不是写死的值。
- *    但 noiseAmp 有可能实测正好是 0(比如 ADC 顶到量程顶死不动,毫无波动),这时
- *    ADC_IDLE_MARGIN_V 就是唯一的安全边界,所以做成 5 档可选(ADC_IDLE_MARGIN_LEVEL,
- *    0~4),范围 -0.001V(最灵敏)~ +0.005V(最保守),见配置区 ADC_IDLE_MARGIN_TABLE。
+ *    峰峰值噪声半幅 noiseAmp(仅打印展示,不进入下面的计算)。标定一结束就打印:
+ *      ADC calibrated: idle=...V noise=+-...V (n=...)
+ *      1) -0.001V set to zero(0%)
+ *      2) -0.002V set to zero(0%)
+ *      3) -0.003V set to zero(0%)
+ *      4) -0.004V set to zero(0%)
+ *      5) -0.005V set to zero(0%)
+ *      send 1~5 + enter to select
+ *    进入 AWAITING_LEVEL 状态等用户选;串口发 '1'~'5' 选定挡位 N 后,
+ *      zero(0%) = mean - N * ADC_ZERO_LEVEL_STEP_V(默认每档 1mV)
+ *    电压 > zero(0%) 都记为 0%,然后才真正转入 RUNNING 开始输出事件行。
  *    另设一个绝对期望值 ADC_NOMINAL_IDLE_V;若标定出的 mean 偏离它超过
  *    ADC_DRIFT_WARN_V(例:期望 3.13V,标定出 3.07V),判定为"可用但异常",
- *    通过串口发英文 WARNING 提示(单独另起一行:第一行数值,第二行
+ *    在挡位菜单之前先发一条英文 WARNING 提示(单独另起一行:第一行数值,第二行
  *    "- still usable but check sensor/wiring")。
  * 4) 100% 基线:ADC 最低点不一定是 0V,固定 < ADC_LOW_FLOOR_V(100mV)记为
  *    100%;threshold(0%) 与 ADC_LOW_FLOOR_V 之间做线性映射得到 0~100%。
@@ -45,7 +50,7 @@
  * 现在只有 IO32 这一路模拟通道。
  * ===================================================================== */
 
-#define FW_VERSION "Piezo VBR-Sen ver1.4.0"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "Piezo VBR-Sen ver1.5.0"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 23;    // 心跳 LED,1 s 翻转一次,用来判断 MCU 是否活着
@@ -66,13 +71,9 @@ constexpr uint32_t ADC_SAMPLE_US      = 400;     // 采样周期 400µs = 2.5kHz
                                                   // 10s 标定无异常;以后再加别的每采样开销,务必重新实测
 constexpr uint32_t ADC_CAL_MS         = 10000;   // 's' 后先花 10s 标定"空闲高电平=0%"基线
 
-// 0% 基线 = 标定均值 - 噪声半幅 - ADC_IDLE_MARGIN_V。噪声半幅是标定时实测出来的,
-// 但如果实测噪声正好是 0(比如 ADC 顶到量程顶死不动),这个余量就成了唯一的安全边界,
-// 所以余量本身做成 5 档可选,从 -0.001V(阈值最灵敏,贴着均值,噪声=0 时几乎没有余量)
-// 到 +0.005V(阈值最保守,离均值最远)。改 ADC_IDLE_MARGIN_LEVEL(0~4)选档,重新烧录生效。
-constexpr float    ADC_IDLE_MARGIN_TABLE[5] = { -0.001f, 0.0005f, 0.002f, 0.0035f, 0.005f };
-constexpr int      ADC_IDLE_MARGIN_LEVEL    = 4;   // 0=最灵敏 -0.001V ... 4=最保守 +0.005V(默认档,等价于原来的固定值)
-constexpr float    ADC_IDLE_MARGIN_V  = ADC_IDLE_MARGIN_TABLE[ADC_IDLE_MARGIN_LEVEL];
+// 0% 基线 = 标定均值 - 挡位选中的偏移量。10s 标定结束后打印 1~5 挡菜单(每挡都是
+// 均值再减一个整数倍的 ADC_ZERO_LEVEL_STEP_V),串口发 '1'~'5' + 回车选定,当场生效。
+constexpr float    ADC_ZERO_LEVEL_STEP_V = 0.001f;  // 每一挡的偏移量,挡位 N(1~5)→ 偏移 = N * 该值
 constexpr float    ADC_LOW_FLOOR_V    = 0.100f;  // 低于此电压(100mV)固定记为 100%
 constexpr float    ADC_NOMINAL_IDLE_V = 3.130f;  // 期望的空闲电压(现场实测值),标定值偏离它超过下面阈值就报警
 constexpr float    ADC_DRIFT_WARN_V   = 0.05f;   // 允许的漂移范围(V)
@@ -97,7 +98,7 @@ void captureAnchor() {
 }
 
 // ---------------- ADC 模拟振动通道(IO32,esp_timer 定时采样,单独一套环形缓冲) ----------------
-enum class AdcPhase : uint8_t { IDLE, CALIBRATING, RUNNING };
+enum class AdcPhase : uint8_t { IDLE, CALIBRATING, AWAITING_LEVEL, RUNNING };
 
 // t = 距整分偏移(单位 TICK_US);raw = ADC 原始采样值(0~4095);centivolt = 校准后电压*100(2 位小数);pct = 幅度 0~100
 struct AdcSample { uint32_t t; uint16_t raw; uint16_t centivolt; uint8_t pct; };
@@ -120,19 +121,19 @@ static double   adcCalSum     = 0;
 static float    adcCalMin     = 0;
 static float    adcCalMax     = 0;
 static uint32_t adcCalCount   = 0;
+static float    adcCalMean    = 0;   // 标定均值,标定结束后保留,供 1~5 选档时计算 zero 用
 
-// 10s 标定窗口结束:算出 0% 基线,顺带检查是否偏离期望值太多
+// 10s 标定窗口结束:先停采样定时器,打印标定摘要 + 1~5 挡菜单,等用户选档(见 selectZeroLevel)
 void adcFinishCalibration() {
   float mean = (adcCalCount > 0) ? (float)(adcCalSum / adcCalCount) : 0.0f;
   float noiseAmp = (adcCalMax - adcCalMin) / 2.0f;
-  float zero = mean - noiseAmp - ADC_IDLE_MARGIN_V;
-  if (zero < ADC_LOW_FLOOR_V + 0.05f) zero = ADC_LOW_FLOOR_V + 0.05f;  // 兜底,避免分母太小/为负
-  adcZeroV = zero;
-  adcPhase = AdcPhase::RUNNING;
+  adcCalMean = mean;
+  esp_timer_stop(adcTimer);            // 挡位还没选定,先不采样,省得空转
+  adcPhase = AdcPhase::AWAITING_LEVEL;
 
-  char line[112];
-  snprintf(line, sizeof(line), "ADC calibrated: idle=%.3fV noise=+-%.3fV zero(0%%)=%.3fV (n=%lu)",
-           mean, noiseAmp, zero, (unsigned long)adcCalCount);
+  char line[96];
+  snprintf(line, sizeof(line), "ADC calibrated: idle=%.3fV noise=+-%.3fV (n=%lu)",
+           mean, noiseAmp, (unsigned long)adcCalCount);
   Serial.println(line);
 
   float drift = mean - ADC_NOMINAL_IDLE_V;
@@ -145,6 +146,31 @@ void adcFinishCalibration() {
     Serial.println(warn);
     Serial.println("- still usable but check sensor/wiring");
   }
+
+  for (int level = 1; level <= 5; level++) {
+    char opt[48];
+    snprintf(opt, sizeof(opt), "%d) -%.3fV set to zero(0%%)", level, level * ADC_ZERO_LEVEL_STEP_V);
+    Serial.println(opt);
+  }
+  Serial.println("send 1~5 + enter to select");
+}
+
+// 收到 '1'~'5':选定挡位,zero(0%) = 标定均值 - level*ADC_ZERO_LEVEL_STEP_V,然后正式转入 RUNNING
+void selectZeroLevel(int level) {
+  if (adcPhase != AdcPhase::AWAITING_LEVEL) {
+    Serial.println("not waiting for a zero-level selection right now");
+    return;
+  }
+  float offset = level * ADC_ZERO_LEVEL_STEP_V;
+  float zero = adcCalMean - offset;
+  if (zero < ADC_LOW_FLOOR_V + 0.05f) zero = ADC_LOW_FLOOR_V + 0.05f;  // 兜底,避免分母太小/为负
+  adcZeroV = zero;
+  adcPhase = AdcPhase::RUNNING;
+  esp_timer_start_periodic(adcTimer, ADC_SAMPLE_US);   // 挡位选完,重新开始采样
+
+  char line[80];
+  snprintf(line, sizeof(line), "zero(0%%) set to %.3fV (level %d, -%.3fV)", zero, level, offset);
+  Serial.println(line);
 }
 
 // esp_timer 周期回调(任务上下文,非真正 ISR,可以放心调 analogRead/Serial):每 ADC_SAMPLE_US 跑一次
@@ -378,6 +404,7 @@ void printHelp() {
   Serial.println(FW_VERSION);
   Serial.println("commands:");
   Serial.println("  s/S   - start sensing (clock must be set first; prints raw/voltage during its 10s calibration)");
+  Serial.println("  1~5   - after calibration, pick the zero(0%) offset level (-0.001V ~ -0.005V)");
   Serial.println("  p/P   - stop sensing (buffered samples keep flushing)");
   Serial.println("  r/R   - reset counter (ccc=1, clear buffer) + show time; clock untouched");
   Serial.println("  T ... - set clock: T YYYYMMDD HHMMSS  (e.g. T 20260827 140000)");
@@ -402,8 +429,9 @@ void printHelp() {
 
   Serial.print("adc: ");
   switch (adcPhase) {
-    case AdcPhase::IDLE:        Serial.println("idle"); break;
-    case AdcPhase::CALIBRATING: Serial.println("calibrating idle level..."); break;
+    case AdcPhase::IDLE:           Serial.println("idle"); break;
+    case AdcPhase::CALIBRATING:    Serial.println("calibrating idle level..."); break;
+    case AdcPhase::AWAITING_LEVEL: Serial.println("waiting for zero-level selection (send 1~5)"); break;
     case AdcPhase::RUNNING: {
       char b[40];
       snprintf(b, sizeof(b), "running (zero=%.3fV)", (double)adcZeroV);
@@ -431,6 +459,7 @@ void handleCmd(const char *s) {
   }
   else if (!strcmp(s, " ")) setTimeCmd("T 20260909 090000");  // 测试快捷键:空格 = 快速设成 2026-09-09 09:00:00
   else if (!strcmp(s, "cal"))                  startCalMonitor();  // 纯校准调试:10s 标定 + 持续打印 raw/电压
+  else if (s[0] >= '1' && s[0] <= '5' && s[1] == '\0') selectZeroLevel(s[0] - '0');  // 标定后选 1~5 挡
   else if (!strcmp(s, "?"))                    printHelp();
   else if (!strcmp(s, "ping"))                 Serial.println("pong");
   else if (s[0] != '\0') { Serial.print("unknown cmd: "); Serial.println(s); }
