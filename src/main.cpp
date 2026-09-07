@@ -43,13 +43,14 @@
  * 现在只有 IO32 这一路模拟通道。
  * ===================================================================== */
 
-#define FW_VERSION "Piezo VBR-Sen ver1.1.0"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "Piezo VBR-Sen ver1.2.0"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 23;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
 constexpr uint32_t LED_INTERVAL_MS = 500;
 constexpr uint32_t TICK_US         = 100;   // 时间计数器分辨率 = 0.1 ms(时间戳单位 = 100µs)
 constexpr uint32_t TX_BUF_BYTES    = 2048;  // 串口发送软缓冲
+constexpr uint32_t CAL_MONITOR_MS  = 200;   // 'cal' 校准调试模式下打印 raw/电压 的间隔,避免刷屏
 
 // ---------------- ADC 模拟振动通道配置(IO32) ----------------
 constexpr int      ADC_PIN            = 32;      // 模拟振动传感器输入(IO32, ADC1_CH4)
@@ -70,6 +71,9 @@ constexpr uint32_t ADC_BUF_SIZE       = 2048;    // ADC 事件发送环形缓冲
 
 static bool timeIsSet    = false;  // 是否已用 'T' 命令设过墙上时间
 static long lastTimeMin  = -1;     // 上次播报的"墙上分钟号"(epoch/60),用于整分触发一次
+
+static bool     calMode         = false;  // 'cal' 命令/开机自检触发的校准调试模式:loop() 里周期打印 raw/电压
+static uint32_t calMonitorLastMs = 0;
 
 static volatile int64_t anchorEspUs   = 0;      // 锚点:esp_timer 读数
 static volatile int64_t anchorEpochUs = 0;      // 锚点:同一时刻的墙上时间(µs since epoch)
@@ -311,12 +315,21 @@ void setTimeCmd(const char *s) {
   Serial.println(buf);
 }
 
+// 收到 'cal' 或开机自检:纯校准调试模式,不需要先设时钟。做一次 10s 的 0% 标定,
+// 期间和之后都由 loop() 周期打印 raw/电压(见 CAL_MONITOR_MS),直到 's' 或 'p' 打断
+void startCalMonitor() {
+  calMode = true;
+  calMonitorLastMs = 0;
+  adcStartCalibration();
+}
+
 // 收到 's'/'S':刷新时间锚点并开始采集(必须先设时钟)。采样偏移以"所在整分"为基准
 void startSensing() {
   if (!timeIsSet) {
     Serial.println("clock not set, send 'T YYYYMMDD HHMMSS' before 's'");
     return;
   }
+  calMode = false;                 // 退出 'cal' 调试模式(如果之前在里面)
   captureAnchor();
 
   char buf[24];
@@ -340,8 +353,9 @@ void zeroCounters() {
   Serial.println();
 }
 
-// 收到 'p'/'P':立即停止采集(缓冲里已有的会继续发完)
+// 收到 'p'/'P':立即停止采集(缓冲里已有的会继续发完),同时退出 'cal' 调试模式
 void stopSensing() {
+  calMode = false;
   adcStop();
   Serial.println("stopped by command");
 }
@@ -354,6 +368,7 @@ void printHelp() {
   Serial.println("  r/R   - reset counter (ccc=1, clear buffer) + show time; clock untouched");
   Serial.println("  T ... - set clock: T YYYYMMDD HHMMSS  (e.g. T 20260827 140000)");
   Serial.println("  <space> - test shortcut: set clock to 2026-09-09 09:00:00");
+  Serial.println("  cal   - debug: 10s zero-level calibration, then keep printing raw/voltage until 's'/'p'");
   Serial.println("  time  - print current clock (or 'not set')");
   Serial.println("  ping  - reply 'pong'");
   Serial.println("  ?     - print this list + current state");
@@ -401,6 +416,7 @@ void handleCmd(const char *s) {
     }
   }
   else if (!strcmp(s, " ")) setTimeCmd("T 20260909 090000");  // 测试快捷键:空格 = 快速设成 2026-09-09 09:00:00
+  else if (!strcmp(s, "cal"))                  startCalMonitor();  // 纯校准调试:10s 标定 + 持续打印 raw/电压
   else if (!strcmp(s, "?"))                    printHelp();
   else if (!strcmp(s, "ping"))                 Serial.println("pong");
   else if (s[0] != '\0') { Serial.print("unknown cmd: "); Serial.println(s); }
@@ -434,6 +450,8 @@ void setup() {
   analogSetPinAttenuation(ADC_PIN, ADC_11db);         // 满幅覆盖 0~3.3V
 
   Serial.println("ready, send 's' to start ('?' for help)");
+
+  startCalMonitor();                                  // 开机自检:自动做一次 10s 0% 标定并持续打印 raw/电压
 }
 
 void loop() {
@@ -460,4 +478,14 @@ void loop() {
 
   // ---- IO32 模拟通道:非阻塞发送一条 "ccc tt.ttttS a.aaV vvvv xx%" ----
   sendAdcLine();
+
+  // ---- 'cal' 调试模式:每 CAL_MONITOR_MS 打印一次当前 raw/电压,标定期间和之后都打印,直到 's'/'p' ----
+  if (calMode && nowMs - calMonitorLastMs >= CAL_MONITOR_MS) {
+    calMonitorLastMs = nowMs;
+    uint16_t cv = adcLastCentivolt;
+    char line[32];
+    snprintf(line, sizeof(line), "raw=%u v=%u.%02uV",
+             (unsigned)adcLastRaw, (unsigned)(cv / 100), (unsigned)(cv % 100));
+    Serial.println(line);
+  }
 }
