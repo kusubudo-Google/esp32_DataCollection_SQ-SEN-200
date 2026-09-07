@@ -3,9 +3,11 @@
 #include <time.h>
 #include <sys/time.h>
 
-#define FW_VERSION "ver3.05.00"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "ver3.06.00"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
+#define SENSOR_ENABLED 0             // IO13 振动检测开关:1=正常挂中断采集,0=禁用中断(仅内部上拉,不响应任何脉冲)
+                                      // 现场 IO13 悬空/未接传感器时设为 0,接好传感器后改回 1 即可恢复采集
 constexpr int      LED_PIN         = 27;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
 constexpr uint32_t LED_INTERVAL_MS = 500;
 constexpr int      SENSOR_PIN      = 13;    // 振动传感器输入(IO13)
@@ -61,6 +63,17 @@ void IRAM_ATTR onFalling() {
     ring[head] = t;
     head = next;
   }
+}
+
+// 统一的中断挂载入口:SENSOR_ENABLED=0 时永远不真正挂中断,isrAttached 也保持 false,
+// 这样所有依赖 isrAttached 的分支(setTimeCmd/zeroCounters/stopSensing)都会自动走"不碰中断"的路径
+void sensorAttachInterrupt() {
+#if SENSOR_ENABLED
+  attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onFalling, FALLING);
+  isrAttached = true;
+#else
+  isrAttached = false;
+#endif
 }
 
 // 只清空缓冲和计数(不动时间锚点)
@@ -132,7 +145,7 @@ void setTimeCmd(const char *s) {
   if (started && isrAttached) {
     detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
     captureAnchor();
-    attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onFalling, FALLING);
+    sensorAttachInterrupt();
   } else {
     captureAnchor();
   }
@@ -153,13 +166,15 @@ void startSensing() {
   resetState();
   detached = false;
   started = true;
-  attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onFalling, FALLING);
-  isrAttached = true;
+  sensorAttachInterrupt();
 
   char buf[24];
   fmtNow(buf, sizeof(buf));
   Serial.print("start @ ");
   Serial.println(buf);            // 's' 的确切时刻;基准 = 向下取整到整分
+#if !SENSOR_ENABLED
+  Serial.println("note: IO13 sensing DISABLED (SENSOR_ENABLED=0), no pulses will be captured");
+#endif
 }
 
 // 收到 'r'/'R':只复位脉冲计数 + 清空缓冲(不动时钟/时间基准),保持当前启停状态
@@ -167,7 +182,7 @@ void zeroCounters() {
   if (started && isrAttached) {
     detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));   // 清缓冲期间挡住 ISR
     clearBuffer();
-    attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onFalling, FALLING);
+    sensorAttachInterrupt();
   } else {
     clearBuffer();
   }
@@ -261,11 +276,14 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  pinMode(SENSOR_PIN, INPUT);                        // 传感器为推挽输出,不需要内部上拉
-  attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onFalling, FALLING);
-  isrAttached = true;
+  pinMode(SENSOR_PIN, INPUT_PULLUP);                 // IO13 当前悬空/传感器未接,开内部上拉防止误触发
+  sensorAttachInterrupt();
   started = false;                                   // 等 's'/'S' 才开始计时
+#if SENSOR_ENABLED
   Serial.println("ready, send 's' to start ('?' for help)");
+#else
+  Serial.println("IO13 sensing DISABLED (SENSOR_ENABLED=0, pull-up only) - edit SENSOR_ENABLED and reflash to re-enable");
+#endif
 }
 
 void loop() {
