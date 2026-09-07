@@ -41,12 +41,12 @@
  * 6) 'T' 设置时钟、每整分播报一次 "time: ..." 的逻辑不变;只在这行末尾追加
  *    当前(最新一次采样)的电压/原始值/幅度,例如
  *    "time: 2026-09-07 14:23:00 3.19V 3958 0%"。
- * 7) 心跳 LED(LED_PIN)保持 1s 翻转不变;检测到振动(>1%)时同一颗 LED 会被强制
- *    点亮(不打断心跳节奏,只是暂时盖过它的输出),要求尽量实时,所以不经过 loop()
- *    轮询——直接在 adcTimerCallback 里 digitalWrite(HIGH),并用一个独立的一次性
- *    esp_timer(ledOffTimer)在 pct*LED_EVENT_US_PER_PCT 微秒后精确关灯(默认每 1%
- *    对应 10µs,100% → 1ms);期间只要还有新样本 >1%,就重新定时(相当于续时,
- *    不会中途被更短的新样本提前关掉)。
+ * 7) 心跳 LED(LED_PIN)保持 1s 翻转不变('ledoff'/'ledon' 可以关掉/恢复心跳,但不影响
+ *    下面的振动指示逻辑);检测到振动(>1%)时同一颗 LED 会被强制点亮(暂时盖过心跳的
+ *    输出),要求尽量实时,所以不经过 loop() 轮询——直接在 adcTimerCallback 里
+ *    digitalWrite(HIGH),并用一个独立的一次性 esp_timer(ledOffTimer)在
+ *    pct*LED_EVENT_US_PER_PCT 微秒后精确关灯(默认每 1% 对应 10µs,100% → 1ms);
+ *    期间只要还有新样本 >1%,就重新定时(相当于续时,不会中途被更短的新样本提前关掉)。
  *
  * IO33 与 IO32 共用同一个传感器插头,现场已把 IO33 接到 GND,固件把它设为
  * 纯输入(不驱动、不加内部上拉),避免和外部 GND 对冲。
@@ -55,7 +55,7 @@
  * 现在只有 IO32 这一路模拟通道。
  * ===================================================================== */
 
-#define FW_VERSION "Piezo VBR-Sen ver1.8.1"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "Piezo VBR-Sen ver1.9.0"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 23;    // 心跳 LED,1 s 翻转一次,用来判断 MCU 是否活着;
@@ -132,6 +132,9 @@ static volatile uint16_t adcLastMillivolt = 0;   // 最新一次采样的电压*
 static volatile bool heartbeatLedState = false;  // 心跳"此刻应该"是什么电平,loop() 按 1s 周期翻转
 static volatile bool ledForcedOn      = false;   // true = 正被振动强制点亮,loop() 心跳翻转时不要碰引脚
 static esp_timer_handle_t ledOffTimer = nullptr;
+
+static bool     heartbeatEnabled = true;  // 收到 'ledoff'/'ledon' 时开关;关闭时不影响振动指示灯
+static uint32_t heartbeatLedLast = 0;     // 上次心跳翻转时刻(millis),'ledon' 时重置,避免立刻多翻一次
 
 // ledOffTimer 到点回调:交还心跳控制权
 void ledOffTimerCallback(void *) {
@@ -438,6 +441,15 @@ void stopSensing() {
   Serial.println("stopped by command");
 }
 
+// 收到 'ledoff'/'ledon':开关心跳 LED,不影响振动指示灯(ledForcedOn 那套逻辑照常工作)
+void setHeartbeat(bool on) {
+  heartbeatEnabled = on;
+  heartbeatLedLast = millis();       // 重新起算相位,避免关闭一段时间后 ledon 立刻多翻一次
+  heartbeatLedState = false;
+  if (!ledForcedOn) digitalWrite(LED_PIN, LOW);
+  Serial.println(on ? "heartbeat on" : "heartbeat off");
+}
+
 void printHelp() {
   Serial.println(FW_VERSION);
   Serial.println("commands:");
@@ -448,6 +460,7 @@ void printHelp() {
   Serial.println("  T ... - set clock: T YYYYMMDD HHMMSS  (e.g. T 20260827 140000)");
   Serial.println("  <space> - test shortcut: set clock to 2026-09-09 09:00:00");
   Serial.println("  cal   - debug: 10s zero-level calibration (no clock needed), prints raw/voltage only during that 10s window");
+  Serial.println("  ledoff/ledon - turn the heartbeat LED off/on (vibration indicator keeps working either way)");
   Serial.println("  time  - print current clock (or 'not set')");
   Serial.println("  ping  - reply 'pong'");
   Serial.println("  ?     - print this list + current state");
@@ -477,6 +490,9 @@ void printHelp() {
       break;
     }
   }
+
+  Serial.print("heartbeat: ");
+  Serial.println(heartbeatEnabled ? "on" : "off");
 }
 
 // 纯数字字符串转挡位:1~ADC_ZERO_LEVEL_COUNT 合法返回 true,否则 false(不用 atoi,避免 "12abc" 这种误判)
@@ -513,6 +529,8 @@ void handleCmd(const char *s) {
   else if (!strcmp(s, " ")) setTimeCmd("T 20260909 090000");  // 测试快捷键:空格 = 快速设成 2026-09-09 09:00:00
   else if (!strcmp(s, "cal"))                  startCalMonitor();  // 纯校准调试:10s 标定 + 持续打印 raw/电压
   else if (parseLevelSelection(s, &lvl))       selectZeroLevel(lvl);  // 标定后选 1~10 挡
+  else if (!strcmp(s, "ledoff"))                setHeartbeat(false);  // 关闭心跳 LED(振动指示灯不受影响)
+  else if (!strcmp(s, "ledon"))                 setHeartbeat(true);   // 重新打开心跳 LED
   else if (!strcmp(s, "?"))                    printHelp();
   else if (!strcmp(s, "ping"))                 Serial.println("pong");
   else if (s[0] != '\0') { Serial.print("unknown cmd: "); Serial.println(s); }
@@ -555,13 +573,12 @@ void setup() {
 }
 
 void loop() {
-  // ---- 心跳 LED:每 1s 翻转一次,loop 一旦卡住心跳就会停 ----
+  // ---- 心跳 LED:每 1s 翻转一次,loop 一旦卡住心跳就会停;'ledoff'/'ledon' 可以关掉/恢复它 ----
   // 振动指示灯改成硬件定时器驱动(见 adcTimerCallback/ledOffTimerCallback),不经过这里轮询;
   // 振动强制点亮期间(ledForcedOn)心跳只更新状态、不去碰引脚,等 ledOffTimer 到点自动交还控制权。
-  static uint32_t ledLast = 0;
   uint32_t nowMs = millis();
-  if (nowMs - ledLast >= LED_INTERVAL_MS) {
-    ledLast = nowMs;
+  if (heartbeatEnabled && nowMs - heartbeatLedLast >= LED_INTERVAL_MS) {
+    heartbeatLedLast = nowMs;
     heartbeatLedState = !heartbeatLedState;
     if (!ledForcedOn) digitalWrite(LED_PIN, heartbeatLedState);
   }

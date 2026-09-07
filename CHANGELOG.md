@@ -9,6 +9,11 @@
 
 ---
 
+## Piezo VBR-Sen ver1.9.0 — 2026-09-07
+
+- 新增 `ledoff`/`ledon` 命令:关闭/重新打开心跳 LED,不影响振动指示灯(振动强制点亮
+  的逻辑照常工作,只是心跳那部分的输出被关掉/恢复)。`?` 状态里也加了 `heartbeat: on/off`
+
 ## Piezo VBR-Sen ver1.8.1 — 2026-09-07
 
 - 修复 bug:标定调试打印偶尔在第一行就打出 `raw=0 v=0.000V`——`calMonitorLastMs` 是在
