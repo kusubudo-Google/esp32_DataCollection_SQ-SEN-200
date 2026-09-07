@@ -9,6 +9,23 @@
 
 ---
 
+## Piezo VBR-Sen ver1.3.2 — 2026-09-07
+
+- 心跳 LED 翻转周期从 0.5s 改为 **1s**(`LED_INTERVAL_MS` 500→1000)
+
+## Piezo VBR-Sen ver1.3.1 — 2026-09-07
+
+- 修一个小问题:'s'/'cal' 触发标定后,第一行调试打印会在 ADC 还没落地第一个采样前就
+  打出 `raw=0 v=0.000V`;改成从触发那一刻起等一个 `CAL_MONITOR_MS` 周期再打印
+- `ADC_NOMINAL_IDLE_V` 从 3.188V 改为 **3.130V**(之前的 3.188V 可能是测量偏差)
+- WARNING 提示改成两行:第一行是漂移数值,第二行单独一行 `- still usable but check sensor/wiring`
+
+## Piezo VBR-Sen ver1.3.0 — 2026-09-07
+
+- 标定调试打印(`raw=... v=...V`)的电压精度从 2 位小数改为 **3 位小数**(`v.vvvV`)
+- `s` 命令触发的 10s 标定期间,现在也会像 `cal` 命令一样打印 `raw=... v=...V`
+  (之前只有单独发 `cal` 才会打印,`s` 触发的标定是静默的)
+
 ## Piezo VBR-Sen ver1.2.1 — 2026-09-07
 
 - 修复 bug:开机自动标定 + 持续打印 `raw=.../v=...V`(每 200ms 一行)把串口刷屏了,

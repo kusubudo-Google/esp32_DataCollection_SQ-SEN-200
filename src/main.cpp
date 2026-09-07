@@ -43,11 +43,11 @@
  * 现在只有 IO32 这一路模拟通道。
  * ===================================================================== */
 
-#define FW_VERSION "Piezo VBR-Sen ver1.2.1"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "Piezo VBR-Sen ver1.3.2"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
-constexpr int      LED_PIN         = 23;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
-constexpr uint32_t LED_INTERVAL_MS = 500;
+constexpr int      LED_PIN         = 23;    // 心跳 LED,1 s 翻转一次,用来判断 MCU 是否活着
+constexpr uint32_t LED_INTERVAL_MS = 1000;
 constexpr uint32_t TICK_US         = 100;   // 时间计数器分辨率 = 0.1 ms(时间戳单位 = 100µs)
 constexpr uint32_t TX_BUF_BYTES    = 2048;  // 串口发送软缓冲
 constexpr uint32_t CAL_MONITOR_MS  = 200;   // 'cal' 校准调试模式下打印 raw/电压 的间隔,避免刷屏
@@ -65,7 +65,7 @@ constexpr uint32_t ADC_SAMPLE_US      = 400;     // 采样周期 400µs = 2.5kHz
 constexpr uint32_t ADC_CAL_MS         = 10000;   // 's' 后先花 10s 标定"空闲高电平=0%"基线
 constexpr float    ADC_IDLE_MARGIN_V  = 0.005f;  // 0% 基线 = 标定均值 - 噪声半幅 - 该余量
 constexpr float    ADC_LOW_FLOOR_V    = 0.100f;  // 低于此电压(100mV)固定记为 100%
-constexpr float    ADC_NOMINAL_IDLE_V = 3.188f;  // 期望的空闲电压(现场实测值),标定值偏离它超过下面阈值就报警
+constexpr float    ADC_NOMINAL_IDLE_V = 3.130f;  // 期望的空闲电压(现场实测值),标定值偏离它超过下面阈值就报警
 constexpr float    ADC_DRIFT_WARN_V   = 0.05f;   // 允许的漂移范围(V)
 constexpr uint32_t ADC_BUF_SIZE       = 2048;    // ADC 事件发送环形缓冲(2 的幂),吸收一次振动事件的突发采样
 
@@ -102,7 +102,8 @@ static volatile AdcPhase adcPhase        = AdcPhase::IDLE;
 static volatile float    adcZeroV        = 0;    // 标定得到的 0% 电压
 static volatile uint8_t  adcLastPct      = 0;    // 最新一次采样的幅度(供 "time:" 行末尾展示)
 static volatile uint16_t adcLastRaw      = 0;    // 最新一次采样的原始 ADC 值(同上)
-static volatile uint16_t adcLastCentivolt = 0;   // 最新一次采样的电压*100(同上)
+static volatile uint16_t adcLastCentivolt = 0;   // 最新一次采样的电压*100,2 位小数(供事件行/time: 行用)
+static volatile uint16_t adcLastMillivolt = 0;   // 最新一次采样的电压*1000,3 位小数(供 'cal' 调试打印用)
 
 static esp_timer_handle_t adcTimer = nullptr;
 static int64_t  adcCalStartUs = 0;
@@ -128,11 +129,12 @@ void adcFinishCalibration() {
   float drift = mean - ADC_NOMINAL_IDLE_V;
   float absDrift = drift < 0 ? -drift : drift;
   if (absDrift > ADC_DRIFT_WARN_V) {
-    char warn[144];
+    char warn[112];
     snprintf(warn, sizeof(warn),
-             "WARNING: ADC idle level drifted to %.3fV (nominal %.3fV, delta %.3fV) - still usable but check sensor/wiring",
+             "WARNING: ADC idle level drifted to %.3fV (nominal %.3fV, delta %.3fV)",
              mean, ADC_NOMINAL_IDLE_V, drift);
     Serial.println(warn);
+    Serial.println("- still usable but check sensor/wiring");
   }
 }
 
@@ -144,6 +146,7 @@ void adcTimerCallback(void *) {
   if (adcPhase == AdcPhase::CALIBRATING) {
     adcLastRaw       = (uint16_t)raw;              // 标定期间也更新电压/原始值,方便 "time:" 行实时展示
     adcLastCentivolt = (uint16_t)(v * 100.0f + 0.5f);  // 百分比还没有基线可算,保持 0 不动
+    adcLastMillivolt = (uint16_t)(v * 1000.0f + 0.5f);
     adcCalSum += v;
     adcCalCount++;
     if (v < adcCalMin) adcCalMin = v;
@@ -166,6 +169,7 @@ void adcTimerCallback(void *) {
   adcLastPct       = pct;
   adcLastRaw       = (uint16_t)raw;
   adcLastCentivolt = centivolt;
+  adcLastMillivolt = (uint16_t)(v * 1000.0f + 0.5f);
 
   if (pct > 1) {                                          // 只有 >1% 才算一次事件,进缓冲等待发送
     int64_t now = esp_timer_get_time();
@@ -319,7 +323,7 @@ void setTimeCmd(const char *s) {
 // 周期打印 raw/电压(见 CAL_MONITOR_MS);标定一结束(转入 RUNNING)打印自动停止
 void startCalMonitor() {
   calMode = true;
-  calMonitorLastMs = 0;
+  calMonitorLastMs = millis();     // 从"此刻"起等一个周期再打印,避开第一个采样还没落地的 0 值
   adcStartCalibration();
 }
 
@@ -329,7 +333,8 @@ void startSensing() {
     Serial.println("clock not set, send 'T YYYYMMDD HHMMSS' before 's'");
     return;
   }
-  calMode = false;                 // 退出 'cal' 调试模式(如果之前在里面)
+  calMode = true;                  // 's' 触发的标定期间同样打印 raw/电压(和 'cal' 命令一致)
+  calMonitorLastMs = millis();
   captureAnchor();
 
   char buf[24];
@@ -363,12 +368,12 @@ void stopSensing() {
 void printHelp() {
   Serial.println(FW_VERSION);
   Serial.println("commands:");
-  Serial.println("  s/S   - start sensing (clock must be set first)");
+  Serial.println("  s/S   - start sensing (clock must be set first; prints raw/voltage during its 10s calibration)");
   Serial.println("  p/P   - stop sensing (buffered samples keep flushing)");
   Serial.println("  r/R   - reset counter (ccc=1, clear buffer) + show time; clock untouched");
   Serial.println("  T ... - set clock: T YYYYMMDD HHMMSS  (e.g. T 20260827 140000)");
   Serial.println("  <space> - test shortcut: set clock to 2026-09-09 09:00:00");
-  Serial.println("  cal   - debug: 10s zero-level calibration, prints raw/voltage only during that 10s window");
+  Serial.println("  cal   - debug: 10s zero-level calibration (no clock needed), prints raw/voltage only during that 10s window");
   Serial.println("  time  - print current clock (or 'not set')");
   Serial.println("  ping  - reply 'pong'");
   Serial.println("  ?     - print this list + current state");
@@ -477,13 +482,13 @@ void loop() {
   // ---- IO32 模拟通道:非阻塞发送一条 "ccc tt.ttttS a.aaV vvvv xx%" ----
   sendAdcLine();
 
-  // ---- 'cal' 调试模式:只在 10s 标定窗口内每 CAL_MONITOR_MS 打印一次 raw/电压,标定一结束就自动停 ----
+  // ---- 校准调试打印:只在 10s 标定窗口内每 CAL_MONITOR_MS 打印一次 raw/电压(3 位小数),标定一结束就自动停 ----
   if (calMode && adcPhase == AdcPhase::CALIBRATING && nowMs - calMonitorLastMs >= CAL_MONITOR_MS) {
     calMonitorLastMs = nowMs;
-    uint16_t cv = adcLastCentivolt;
+    uint16_t mv = adcLastMillivolt;
     char line[32];
-    snprintf(line, sizeof(line), "raw=%u v=%u.%02uV",
-             (unsigned)adcLastRaw, (unsigned)(cv / 100), (unsigned)(cv % 100));
+    snprintf(line, sizeof(line), "raw=%u v=%u.%03uV",
+             (unsigned)adcLastRaw, (unsigned)(mv / 1000), (unsigned)(mv % 1000));
     Serial.println(line);
   }
 }
