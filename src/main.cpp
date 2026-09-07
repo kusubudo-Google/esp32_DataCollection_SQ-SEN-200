@@ -12,14 +12,13 @@
  * 3) 0% 基线标定:'s' 之后先连续采样 ADC_CAL_MS(10 s),统计均值 mean 和
  *    峰峰值噪声半幅 noiseAmp(仅打印展示,不进入下面的计算)。标定一结束就打印:
  *      ADC calibrated: idle=...V noise=+-...V (n=...)
- *      1) -0.001V set to zero(0%)
- *      2) -0.002V set to zero(0%)
- *      3) -0.003V set to zero(0%)
- *      4) -0.004V set to zero(0%)
- *      5) -0.005V set to zero(0%)
- *      send 1~5 + enter to select
- *    进入 AWAITING_LEVEL 状态等用户选;串口发 '1'~'5' 选定挡位 N 后,
- *      zero(0%) = mean - N * ADC_ZERO_LEVEL_STEP_V(默认每档 1mV)
+ *      1) -0.010V set to zero(0%)
+ *      2) -0.020V set to zero(0%)
+ *      ...(依次 +10mV 一档)
+ *      10) -0.100V set to zero(0%)
+ *      send 1~10 + enter to select
+ *    进入 AWAITING_LEVEL 状态等用户选;串口发 '1'~'10' 选定挡位 N 后,
+ *      zero(0%) = mean - N * ADC_ZERO_LEVEL_STEP_V(默认每档 10mV,范围 -10mV~-100mV)
  *    电压 > zero(0%) 都记为 0%,然后才真正转入 RUNNING 开始输出事件行。
  *    另设一个绝对期望值 ADC_NOMINAL_IDLE_V;若标定出的 mean 偏离它超过
  *    ADC_DRIFT_WARN_V(例:期望 3.13V,标定出 3.07V),判定为"可用但异常",
@@ -50,7 +49,7 @@
  * 现在只有 IO32 这一路模拟通道。
  * ===================================================================== */
 
-#define FW_VERSION "Piezo VBR-Sen ver1.5.0"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "Piezo VBR-Sen ver1.6.0"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 23;    // 心跳 LED,1 s 翻转一次,用来判断 MCU 是否活着
@@ -71,9 +70,10 @@ constexpr uint32_t ADC_SAMPLE_US      = 400;     // 采样周期 400µs = 2.5kHz
                                                   // 10s 标定无异常;以后再加别的每采样开销,务必重新实测
 constexpr uint32_t ADC_CAL_MS         = 10000;   // 's' 后先花 10s 标定"空闲高电平=0%"基线
 
-// 0% 基线 = 标定均值 - 挡位选中的偏移量。10s 标定结束后打印 1~5 挡菜单(每挡都是
-// 均值再减一个整数倍的 ADC_ZERO_LEVEL_STEP_V),串口发 '1'~'5' + 回车选定,当场生效。
-constexpr float    ADC_ZERO_LEVEL_STEP_V = 0.001f;  // 每一挡的偏移量,挡位 N(1~5)→ 偏移 = N * 该值
+// 0% 基线 = 标定均值 - 挡位选中的偏移量。10s 标定结束后打印 1~10 挡菜单(每挡都是
+// 均值再减一个整数倍的 ADC_ZERO_LEVEL_STEP_V,即 10mV~100mV),串口发 '1'~'10' + 回车选定,当场生效。
+constexpr float    ADC_ZERO_LEVEL_STEP_V = 0.01f;   // 每一挡的偏移量,挡位 N(1~10)→ 偏移 = N * 该值
+constexpr int      ADC_ZERO_LEVEL_COUNT  = 10;      // 挡位总数
 constexpr float    ADC_LOW_FLOOR_V    = 0.100f;  // 低于此电压(100mV)固定记为 100%
 constexpr float    ADC_NOMINAL_IDLE_V = 3.130f;  // 期望的空闲电压(现场实测值),标定值偏离它超过下面阈值就报警
 constexpr float    ADC_DRIFT_WARN_V   = 0.05f;   // 允许的漂移范围(V)
@@ -121,9 +121,9 @@ static double   adcCalSum     = 0;
 static float    adcCalMin     = 0;
 static float    adcCalMax     = 0;
 static uint32_t adcCalCount   = 0;
-static float    adcCalMean    = 0;   // 标定均值,标定结束后保留,供 1~5 选档时计算 zero 用
+static float    adcCalMean    = 0;   // 标定均值,标定结束后保留,供 1~10 选档时计算 zero 用
 
-// 10s 标定窗口结束:先停采样定时器,打印标定摘要 + 1~5 挡菜单,等用户选档(见 selectZeroLevel)
+// 10s 标定窗口结束:先停采样定时器,打印标定摘要 + 1~10 挡菜单,等用户选档(见 selectZeroLevel)
 void adcFinishCalibration() {
   float mean = (adcCalCount > 0) ? (float)(adcCalSum / adcCalCount) : 0.0f;
   float noiseAmp = (adcCalMax - adcCalMin) / 2.0f;
@@ -147,18 +147,24 @@ void adcFinishCalibration() {
     Serial.println("- still usable but check sensor/wiring");
   }
 
-  for (int level = 1; level <= 5; level++) {
+  for (int level = 1; level <= ADC_ZERO_LEVEL_COUNT; level++) {
     char opt[48];
     snprintf(opt, sizeof(opt), "%d) -%.3fV set to zero(0%%)", level, level * ADC_ZERO_LEVEL_STEP_V);
     Serial.println(opt);
   }
-  Serial.println("send 1~5 + enter to select");
+  char prompt[32];
+  snprintf(prompt, sizeof(prompt), "send 1~%d + enter to select", ADC_ZERO_LEVEL_COUNT);
+  Serial.println(prompt);
 }
 
-// 收到 '1'~'5':选定挡位,zero(0%) = 标定均值 - level*ADC_ZERO_LEVEL_STEP_V,然后正式转入 RUNNING
+// 收到 '1'~'10':选定挡位,zero(0%) = 标定均值 - level*ADC_ZERO_LEVEL_STEP_V,然后正式转入 RUNNING
 void selectZeroLevel(int level) {
   if (adcPhase != AdcPhase::AWAITING_LEVEL) {
     Serial.println("not waiting for a zero-level selection right now");
+    return;
+  }
+  if (level < 1 || level > ADC_ZERO_LEVEL_COUNT) {
+    Serial.println("bad level, send 1~10");
     return;
   }
   float offset = level * ADC_ZERO_LEVEL_STEP_V;
@@ -404,7 +410,7 @@ void printHelp() {
   Serial.println(FW_VERSION);
   Serial.println("commands:");
   Serial.println("  s/S   - start sensing (clock must be set first; prints raw/voltage during its 10s calibration)");
-  Serial.println("  1~5   - after calibration, pick the zero(0%) offset level (-0.001V ~ -0.005V)");
+  Serial.println("  1~10  - after calibration, pick the zero(0%) offset level (-0.010V ~ -0.100V)");
   Serial.println("  p/P   - stop sensing (buffered samples keep flushing)");
   Serial.println("  r/R   - reset counter (ccc=1, clear buffer) + show time; clock untouched");
   Serial.println("  T ... - set clock: T YYYYMMDD HHMMSS  (e.g. T 20260827 140000)");
@@ -431,7 +437,7 @@ void printHelp() {
   switch (adcPhase) {
     case AdcPhase::IDLE:           Serial.println("idle"); break;
     case AdcPhase::CALIBRATING:    Serial.println("calibrating idle level..."); break;
-    case AdcPhase::AWAITING_LEVEL: Serial.println("waiting for zero-level selection (send 1~5)"); break;
+    case AdcPhase::AWAITING_LEVEL: Serial.println("waiting for zero-level selection (send 1~10)"); break;
     case AdcPhase::RUNNING: {
       char b[40];
       snprintf(b, sizeof(b), "running (zero=%.3fV)", (double)adcZeroV);
@@ -441,8 +447,23 @@ void printHelp() {
   }
 }
 
+// 纯数字字符串转挡位:1~ADC_ZERO_LEVEL_COUNT 合法返回 true,否则 false(不用 atoi,避免 "12abc" 这种误判)
+bool parseLevelSelection(const char *s, int *level) {
+  if (s[0] == '\0') return false;
+  int v = 0;
+  for (const char *p = s; *p; p++) {
+    if (*p < '0' || *p > '9') return false;
+    v = v * 10 + (*p - '0');
+    if (v > ADC_ZERO_LEVEL_COUNT) return false;
+  }
+  if (v < 1) return false;
+  *level = v;
+  return true;
+}
+
 // 处理一行串口命令
 void handleCmd(const char *s) {
+  int lvl = 0;
   if      (!strcmp(s, "s") || !strcmp(s, "S")) startSensing();
   else if (!strcmp(s, "p") || !strcmp(s, "P")) stopSensing();
   else if (!strcmp(s, "r") || !strcmp(s, "R")) zeroCounters();
@@ -459,7 +480,7 @@ void handleCmd(const char *s) {
   }
   else if (!strcmp(s, " ")) setTimeCmd("T 20260909 090000");  // 测试快捷键:空格 = 快速设成 2026-09-09 09:00:00
   else if (!strcmp(s, "cal"))                  startCalMonitor();  // 纯校准调试:10s 标定 + 持续打印 raw/电压
-  else if (s[0] >= '1' && s[0] <= '5' && s[1] == '\0') selectZeroLevel(s[0] - '0');  // 标定后选 1~5 挡
+  else if (parseLevelSelection(s, &lvl))       selectZeroLevel(lvl);  // 标定后选 1~10 挡
   else if (!strcmp(s, "?"))                    printHelp();
   else if (!strcmp(s, "ping"))                 Serial.println("pong");
   else if (s[0] != '\0') { Serial.print("unknown cmd: "); Serial.println(s); }
