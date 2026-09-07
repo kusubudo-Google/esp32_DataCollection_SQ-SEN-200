@@ -9,6 +9,11 @@
 
 ---
 
+## Piezo VBR-Sen ver1.0.1 — 2026-09-07
+
+- 修复 bug:标定期间(10s)`time:` 行末尾一直显示 `0.00V 0 0%`,是因为 `adcLastRaw/adcLastCentivolt`
+  只在标定完成、进入 RUNNING 后才更新。改为标定期间也实时更新电压/原始值(百分比在标定完成前无意义,仍固定 0)
+
 ## Piezo VBR-Sen ver1.0.0 — 2026-09-07
 
 - 产品/固件重新命名为 **Piezo VBR-Sen**,版本号从 `verMAJOR.MINOR.PATCH`(两位数字)方案

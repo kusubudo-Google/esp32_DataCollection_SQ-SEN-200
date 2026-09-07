@@ -43,7 +43,7 @@
  * 现在只有 IO32 这一路模拟通道。
  * ===================================================================== */
 
-#define FW_VERSION "Piezo VBR-Sen ver1.0.0"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "Piezo VBR-Sen ver1.0.1"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 23;    // 心跳 LED,0.5 s 翻转一次,用来判断 MCU 是否活着
@@ -138,6 +138,8 @@ void adcTimerCallback(void *) {
   float    v   = analogReadMilliVolts(ADC_PIN) / 1000.0f;  // 校准后电压,百分比计算仍然只认这个
 
   if (adcPhase == AdcPhase::CALIBRATING) {
+    adcLastRaw       = (uint16_t)raw;              // 标定期间也更新电压/原始值,方便 "time:" 行实时展示
+    adcLastCentivolt = (uint16_t)(v * 100.0f + 0.5f);  // 百分比还没有基线可算,保持 0 不动
     adcCalSum += v;
     adcCalCount++;
     if (v < adcCalMin) adcCalMin = v;
