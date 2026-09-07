@@ -9,6 +9,13 @@
 
 ---
 
+## ver3.08.00 — 2026-09-07
+
+- ADC 事件行格式改为 `ccc tt.ttttS a.aaV vvvv xx%`,新增背景参考值:
+  `a.aaV`=校准后电压(analogReadMilliVolts)、`vvvv`=原始 ADC 采样值(analogRead,0~4095)
+- 每分钟 `time:` 播报行同步追加电压/原始值,格式变为 `time: ... a.aaV vvvv xx%`
+- 百分比计算逻辑不变,仍然只用校准后电压;新增的原始值只读一次、纯展示用
+
 ## ver3.07.02 — 2026-09-07
 
 - 实机二分法测出 ADC 采样定时器的看门狗硬上限:100/120µs 必炸 `task_wdt`,135µs 起才稳,

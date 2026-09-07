@@ -20,23 +20,26 @@
  *    通过串口发一行英文 WARNING 提示。
  * 4) 100% 基线:ADC 最低点不一定是 0V,固定 < ADC_LOW_FLOOR_V(100mV)记为
  *    100%;threshold(0%) 与 ADC_LOW_FLOOR_V 之间做线性映射得到 0~100%。
- * 5) 输出行格式 "ccc tt.ttttS xx%"(例:04 23.2311S 23%):
+ * 5) 输出行格式 "ccc tt.ttttS a.aaV vvvv xx%"(例:04 23.2311S 2.21V 4012 23%):
  *      ccc      = 事件计数器,2 位起,从 1 开始,'s'/'r' 时复位
  *      tt.ttttS = 距最近一条 "time:" 整分基准的秒偏移,4 位小数(0.1ms 分辨率)+ 'S'
- *      xx%      = 该次采样幅度百分比(0~100,四舍五入取整)
+ *      a.aaV    = 校准后的电压值(analogReadMilliVolts,2 位小数),背景参考值
+ *      vvvv     = 该次 ADC 原始采样值(analogRead 原始 0~4095 计数),背景参考值
+ *      xx%      = 该次采样幅度百分比(0~100,四舍五入取整,由 a.aaV 换算而来)
  *    只有幅度 > 1% 的采样才输出一行,采样率越高、脉冲越宽,输出行数越多
  *    (例:采样周期 50µs、脉冲 >1% 宽度 400µs → 理论应输出 8 行;但实机二分法测出
  *    esp_timer 硬上限在 120~135µs 之间,超过就必炸 task_wdt 重启,50µs 不可行,
  *    默认改用留有余量的 200µs/5kHz,见 ADC_SAMPLE_US 的注释)。空闲(≤1%)不输出,
  *    不占用串口带宽。
  * 6) 'T' 设置时钟、每整分播报一次 "time: ..." 的逻辑不变;只在这行末尾追加
- *    当前(最新一次采样)的幅度百分比,例如 "time: 2026-09-07 14:23:00 0%"。
+ *    当前(最新一次采样)的电压/原始值/幅度,例如
+ *    "time: 2026-09-07 14:23:00 3.19V 3958 0%"。
  *
  * IO33 与 IO32 共用同一个传感器插头,现场已把 IO33 接到 GND,固件把它设为
  * 纯输入(不驱动、不加内部上拉),避免和外部 GND 对冲。
  * ===================================================================== */
 
-#define FW_VERSION "ver3.07.02"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "ver3.08.00"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 #define SENSOR_ENABLED 0             // IO13 振动检测开关:1=正常挂中断采集,0=禁用中断(仅内部上拉,不响应任何脉冲)
@@ -143,16 +146,19 @@ void resetState() {
 // ---------------- ADC 模拟振动通道(IO32,esp_timer 定时采样,单独一套环形缓冲) ----------------
 enum class AdcPhase : uint8_t { IDLE, CALIBRATING, RUNNING };
 
-struct AdcSample { uint32_t t; uint8_t pct; };   // t = 距整分偏移(单位 TICK_US),pct = 幅度 0~100
+// t = 距整分偏移(单位 TICK_US);raw = ADC 原始采样值(0~4095);centivolt = 校准后电压*100(2 位小数);pct = 幅度 0~100
+struct AdcSample { uint32_t t; uint16_t raw; uint16_t centivolt; uint8_t pct; };
 static AdcSample adcRing[ADC_BUF_SIZE];
 static volatile uint32_t adcHead    = 0;         // adc 定时器回调写
 static volatile uint32_t adcTail    = 0;         // loop 读
 static volatile uint32_t adcDropped = 0;         // 缓冲满导致的丢失计数
 static uint32_t adcSendIdx = 1;                  // 发送端计数(= 输出里的 ccc),只有 loop 碰
 
-static volatile AdcPhase adcPhase   = AdcPhase::IDLE;
-static volatile float    adcZeroV   = 0;         // 标定得到的 0% 电压
-static volatile uint8_t  adcLastPct = 0;         // 最新一次采样的幅度(供 "time:" 行末尾展示)
+static volatile AdcPhase adcPhase        = AdcPhase::IDLE;
+static volatile float    adcZeroV        = 0;    // 标定得到的 0% 电压
+static volatile uint8_t  adcLastPct      = 0;    // 最新一次采样的幅度(供 "time:" 行末尾展示)
+static volatile uint16_t adcLastRaw      = 0;    // 最新一次采样的原始 ADC 值(同上)
+static volatile uint16_t adcLastCentivolt = 0;   // 最新一次采样的电压*100(同上)
 
 static esp_timer_handle_t adcTimer = nullptr;
 static int64_t  adcCalStartUs = 0;
@@ -188,7 +194,8 @@ void adcFinishCalibration() {
 
 // esp_timer 周期回调(任务上下文,非真正 ISR,可以放心调 analogRead/Serial):每 ADC_SAMPLE_US 跑一次
 void adcTimerCallback(void *) {
-  float v = analogReadMilliVolts(ADC_PIN) / 1000.0f;
+  int      raw = analogRead(ADC_PIN);              // 原始采样值 0~4095,单独读一次(用于调试展示)
+  float    v   = analogReadMilliVolts(ADC_PIN) / 1000.0f;  // 校准后电压,百分比计算仍然只认这个
 
   if (adcPhase == AdcPhase::CALIBRATING) {
     adcCalSum += v;
@@ -208,8 +215,11 @@ void adcTimerCallback(void *) {
   float pctF = 100.0f * (adcZeroV - v) / denom;
   if (pctF < 0)   pctF = 0;
   if (pctF > 100) pctF = 100;
-  uint8_t pct = (uint8_t)(pctF + 0.5f);
-  adcLastPct = pct;
+  uint8_t  pct        = (uint8_t)(pctF + 0.5f);
+  uint16_t centivolt  = (uint16_t)(v * 100.0f + 0.5f);
+  adcLastPct       = pct;
+  adcLastRaw       = (uint16_t)raw;
+  adcLastCentivolt = centivolt;
 
   if (pct > 1) {                                          // 只有 >1% 才算一次事件,进缓冲等待发送
     int64_t now = esp_timer_get_time();
@@ -220,8 +230,10 @@ void adcTimerCallback(void *) {
     if (next == adcTail) {
       adcDropped++;                                       // 缓冲满,丢弃
     } else {
-      adcRing[adcHead].t   = t;
-      adcRing[adcHead].pct = pct;
+      adcRing[adcHead].t         = t;
+      adcRing[adcHead].raw       = (uint16_t)raw;
+      adcRing[adcHead].centivolt = centivolt;
+      adcRing[adcHead].pct       = pct;
       adcHead = next;
     }
   }
@@ -272,15 +284,16 @@ void adcResetRuntime() {
   if (wasRunning) esp_timer_start_periodic(adcTimer, ADC_SAMPLE_US);
 }
 
-// 非阻塞发送一行 ADC 事件,格式 "ccc tt.ttttS xx%"
+// 非阻塞发送一行 ADC 事件,格式 "ccc tt.ttttS a.aaV vvvv xx%"
 void sendAdcLine() {
   if (adcTail == adcHead) return;
   AdcSample s = adcRing[adcTail];
-  char line[32];
-  int n = snprintf(line, sizeof(line), "%02lu %lu.%04luS %u%%\n",
+  char line[48];
+  int n = snprintf(line, sizeof(line), "%02lu %lu.%04luS %u.%02uV %u %u%%\n",
                    (unsigned long)adcSendIdx,
                    (unsigned long)(s.t / 10000), (unsigned long)(s.t % 10000),
-                   (unsigned)s.pct);
+                   (unsigned)(s.centivolt / 100), (unsigned)(s.centivolt % 100),
+                   (unsigned)s.raw, (unsigned)s.pct);
   if (Serial.availableForWrite() >= n) {
     Serial.write((const uint8_t *)line, n);
     adcTail = (adcTail + 1) & (ADC_BUF_SIZE - 1);
@@ -304,17 +317,20 @@ void fmtMinute(char *out, size_t n, time_t t) {
   strftime(out, n, "%Y-%m-%d %H:%M:%S", &tm);
 }
 
-// 播报一行基准时间:"time: YYYY-MM-DD HH:MM:00 xx%"(末尾是当前 ADC 幅度),并记住这一分钟
+// 播报一行基准时间:"time: YYYY-MM-DD HH:MM:00 a.aaV vvvv xx%"(末尾是当前 ADC 电压/原始值/幅度),并记住这一分钟
 void emitTimeBase() {
   time_t now = time(NULL);
   lastTimeMin = (long)(now / 60);
   char buf[24];
   fmtMinute(buf, sizeof(buf), now);
+  uint16_t cv = adcLastCentivolt;
+  char tail[24];
+  snprintf(tail, sizeof(tail), " %u.%02uV %u %u%%",
+           (unsigned)(cv / 100), (unsigned)(cv % 100),
+           (unsigned)adcLastRaw, (unsigned)adcLastPct);
   Serial.print("time: ");
   Serial.print(buf);
-  Serial.print(" ");
-  Serial.print((unsigned)adcLastPct);
-  Serial.println("%");
+  Serial.println(tail);
 }
 
 // 收到 'T YYYYMMDD HHMMSS':设定墙上时间
@@ -421,8 +437,8 @@ void printHelp() {
   Serial.println("  ping  - reply 'pong'");
   Serial.println("  ?     - print this list + current state");
   Serial.println("pulse line: 'aa sss.ssss s' = offset from the preceding 'time: HH:MM:00' base");
-  Serial.println("adc line:   'ccc tt.ttttS xx%' = IO32 amplitude sample >1% (0%=idle baseline, 100%=<100mV)");
-  Serial.println("'time:' base prints at each whole minute (sensing or not), ends with current adc amplitude");
+  Serial.println("adc line:   'ccc tt.ttttS a.aaV vvvv xx%' = IO32 sample >1% (a.aaV/vvvv=voltage/raw for reference, xx%=amplitude)");
+  Serial.println("'time:' base prints at each whole minute (sensing or not), ends with current adc voltage/raw/amplitude");
 
   Serial.print("state: ");
   Serial.println(started ? "sensing" : "stopped");
