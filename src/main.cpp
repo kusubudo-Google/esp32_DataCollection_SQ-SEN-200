@@ -30,7 +30,7 @@
  *      ccc      = 事件计数器,2 位起,从 1 开始,'s'/'r' 时复位
  *      tt.ttttS = 距最近一条 "time:" 整分基准的秒偏移,4 位小数(0.1ms 分辨率)+ 'S'
  *      a.aaV    = 校准后的电压值(analogReadMilliVolts,2 位小数),背景参考值
- *      vvvv     = 该次 ADC 原始采样值(analogRead 原始 0~4095 计数),背景参考值
+ *      vvvv     = 该次 ADC 原始采样值(analogRead 原始 0~4095 计数),固定补零到 4 位,背景参考值
  *      xx%      = 该次采样幅度百分比(0~100,四舍五入取整,由 a.aaV 换算而来)
  *    只有幅度 > 1% 的采样才输出一行,采样率越高、脉冲越宽,输出行数越多
  *    (例:采样周期 50µs、脉冲 >1% 宽度 400µs → 理论应输出 8 行;但实机二分法测出
@@ -58,7 +58,7 @@
  * 现在只有 IO32 这一路模拟通道。
  * ===================================================================== */
 
-#define FW_VERSION "Piezo VBR-Sen ver1.10.0"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "Piezo VBR-Sen ver1.10.1"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 23;    // 心跳 LED,1 s 翻转一次,用来判断 MCU 是否活着;
@@ -325,7 +325,7 @@ void sendAdcLine() {
   if (adcTail == adcHead) return;
   AdcSample s = adcRing[adcTail];
   char line[48];
-  int n = snprintf(line, sizeof(line), "%02lu %lu.%04luS %u.%02uV %u %u%%\n",
+  int n = snprintf(line, sizeof(line), "%02lu %lu.%04luS %u.%02uV %04u %u%%\n",
                    (unsigned long)adcSendIdx,
                    (unsigned long)(s.t / 10000), (unsigned long)(s.t % 10000),
                    (unsigned)(s.centivolt / 100), (unsigned)(s.centivolt % 100),
@@ -361,7 +361,7 @@ void emitTimeBase() {
   fmtMinute(buf, sizeof(buf), now);
   uint16_t cv = adcLastCentivolt;
   char tail[24];
-  snprintf(tail, sizeof(tail), " %u.%02uV %u %u%%",
+  snprintf(tail, sizeof(tail), " %u.%02uV %04u %u%%",
            (unsigned)(cv / 100), (unsigned)(cv % 100),
            (unsigned)adcLastRaw, (unsigned)adcLastPct);
   Serial.print("time: ");
@@ -636,7 +636,7 @@ void loop() {
     char tbuf[24];
     fmtNow(tbuf, sizeof(tbuf));      // 若时钟还没设过('cal' 不要求先设时钟),这里就是 1970 起算的默认时间
     char line[56];
-    snprintf(line, sizeof(line), "%s  raw=%u v=%u.%03uV",
+    snprintf(line, sizeof(line), "%s  raw=%04u v=%u.%03uV",
              tbuf, (unsigned)adcLastRaw, (unsigned)(mv / 1000), (unsigned)(mv % 1000));
     Serial.println(line);
   }
