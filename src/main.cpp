@@ -37,7 +37,10 @@
  *    esp_timer 硬上限跟每次回调干的活直接相关——只读校准电压时上限在 120~135µs,
  *    多读一次 raw 原始值后上限退到 220~250µs,超过就必炸 task_wdt 重启,50µs 不可行,
  *    默认改用留有余量的 400µs/2.5kHz,见 ADC_SAMPLE_US 的注释)。空闲(≤1%)不输出,
- *    不占用串口带宽。
+ *    不占用串口带宽。RUNNING 期间发 'adccnt' 可以临时关掉这个 >1% 门槛,每次采样都输出
+ *    (方便连续观察读数,串口带宽通常跟不上 2.5kHz 会大量丢包,是预期行为);发空格退出、
+ *    恢复只在 >1% 时输出。这个开关只影响是否进环形缓冲发送,不影响振动指示灯(LED 只认
+ *    真正 >1% 的样本)。
  * 6) 'T' 设置时钟、每整分播报一次 "time: ..." 的逻辑不变;只在这行末尾追加
  *    当前(最新一次采样)的电压/原始值/幅度,例如
  *    "time: 2026-09-07 14:23:00 3.19V 3958 0%"。
@@ -55,7 +58,7 @@
  * 现在只有 IO32 这一路模拟通道。
  * ===================================================================== */
 
-#define FW_VERSION "Piezo VBR-Sen ver1.9.0"   // 固件版本(每次改动由 Claude 递增)
+#define FW_VERSION "Piezo VBR-Sen ver1.10.0"   // 固件版本(每次改动由 Claude 递增)
 
 // ---------------- 配置 ----------------
 constexpr int      LED_PIN         = 23;    // 心跳 LED,1 s 翻转一次,用来判断 MCU 是否活着;
@@ -94,6 +97,11 @@ static long lastTimeMin  = -1;     // 上次播报的"墙上分钟号"(epoch/60)
 
 static bool     calMode         = false;  // 'cal' 命令/开机自检触发的校准调试模式:loop() 里周期打印 raw/电压
 static uint32_t calMonitorLastMs = 0;
+
+// 'adccnt':RUNNING 期间让每次采样都当事件输出(不再要求 >1%),用于连续观察 ADC 读数;
+// 只影响要不要进环形缓冲发出去,不影响振动指示灯(LED 依然只认真正 >1% 的样本)。
+// 发空格退出,回到正常的 >1% 触发模式。
+static volatile bool adcContinuousMode = false;
 
 static volatile int64_t anchorEspUs   = 0;      // 锚点:esp_timer 读数
 static volatile int64_t anchorEpochUs = 0;      // 锚点:同一时刻的墙上时间(µs since epoch)
@@ -239,16 +247,18 @@ void adcTimerCallback(void *) {
   adcLastCentivolt = centivolt;
   adcLastMillivolt = (uint16_t)(v * 1000.0f + 0.5f);
 
-  if (pct > 1) {                                          // 只有 >1% 才算一次事件,进缓冲等待发送
-    int64_t now = esp_timer_get_time();
-
+  bool ledTrigger = (pct > 1);          // 振动指示灯只认真正 >1% 的样本,不受 adcContinuousMode 影响
+  if (ledTrigger) {
     if (!ledForcedOn) {                                    // 振动指示灯:硬件定时器驱动,实时点亮/续时
       ledForcedOn = true;
       digitalWrite(LED_PIN, HIGH);
     }
     esp_timer_stop(ledOffTimer);                            // 忽略返回值:没在跑也没关系
     esp_timer_start_once(ledOffTimer, (uint64_t)pct * LED_EVENT_US_PER_PCT);  // 幅度越大续时越久
+  }
 
+  if (ledTrigger || adcContinuousMode) {   // 'adccnt' 时每次采样都当事件输出,不用等 >1%
+    int64_t now = esp_timer_get_time();
     int64_t epochUs = anchorEpochUs + (now - anchorEspUs); // 用同一套时钟锚点换算绝对时刻
     uint32_t t = (uint32_t)((epochUs % 60000000LL) / TICK_US);
 
@@ -400,6 +410,7 @@ void setTimeCmd(const char *s) {
 void startCalMonitor() {
   calMode = true;
   calMonitorLastMs = millis();     // 从"此刻"起等一个周期再打印,避开第一个采样还没落地的 0 值
+  adcContinuousMode = false;
   adcStartCalibration();
 }
 
@@ -411,6 +422,7 @@ void startSensing() {
   }
   calMode = true;                  // 's' 触发的标定期间同样打印 raw/电压(和 'cal' 命令一致)
   calMonitorLastMs = millis();
+  adcContinuousMode = false;
   captureAnchor();
 
   char buf[24];
@@ -434,11 +446,18 @@ void zeroCounters() {
   Serial.println();
 }
 
-// 收到 'p'/'P':立即停止采集(缓冲里已有的会继续发完),同时退出 'cal' 调试模式
+// 收到 'p'/'P':立即停止采集(缓冲里已有的会继续发完),同时退出 'cal'/'adccnt' 调试模式
 void stopSensing() {
   calMode = false;
+  adcContinuousMode = false;
   adcStop();
   Serial.println("stopped by command");
+}
+
+// 收到 'adccnt':RUNNING 期间每次采样都当事件输出,不用等 >1%,方便连续观察 ADC 读数
+void startAdcContinuous() {
+  adcContinuousMode = true;
+  Serial.println("adc continuous output on (every sample, not just >1%) - send space to go back");
 }
 
 // 收到 'ledoff'/'ledon':开关心跳 LED,不影响振动指示灯(ledForcedOn 那套逻辑照常工作)
@@ -458,8 +477,9 @@ void printHelp() {
   Serial.println("  p/P   - stop sensing (buffered samples keep flushing)");
   Serial.println("  r/R   - reset counter (ccc=1, clear buffer) + show time; clock untouched");
   Serial.println("  T ... - set clock: T YYYYMMDD HHMMSS  (e.g. T 20260827 140000)");
-  Serial.println("  <space> - test shortcut: set clock to 2026-09-09 09:00:00");
+  Serial.println("  <space> - test shortcut: set clock to 2026-09-09 09:00:00 (while adccnt is on, exits it instead)");
   Serial.println("  cal   - debug: 10s zero-level calibration (no clock needed), prints raw/voltage only during that 10s window");
+  Serial.println("  adccnt - while running, output every sample (not just >1%); send space to go back");
   Serial.println("  ledoff/ledon - turn the heartbeat LED off/on (vibration indicator keeps working either way)");
   Serial.println("  time  - print current clock (or 'not set')");
   Serial.println("  ping  - reply 'pong'");
@@ -484,8 +504,9 @@ void printHelp() {
     case AdcPhase::CALIBRATING:    Serial.println("calibrating idle level..."); break;
     case AdcPhase::AWAITING_LEVEL: Serial.println("waiting for zero-level selection (send 1~10)"); break;
     case AdcPhase::RUNNING: {
-      char b[40];
-      snprintf(b, sizeof(b), "running (zero=%.3fV)", (double)adcZeroV);
+      char b[64];
+      snprintf(b, sizeof(b), "running (zero=%.3fV)%s", (double)adcZeroV,
+               adcContinuousMode ? ", continuous output on" : "");
       Serial.println(b);
       break;
     }
@@ -526,8 +547,17 @@ void handleCmd(const char *s) {
       Serial.println("clock not set, send 'T YYYYMMDD HHMMSS'");
     }
   }
-  else if (!strcmp(s, " ")) setTimeCmd("T 20260909 090000");  // 测试快捷键:空格 = 快速设成 2026-09-09 09:00:00
+  else if (!strcmp(s, " ")) {
+    // 空格是双重含义的快捷键:'adccnt' 连续输出模式下用来退出它;平时才是"快速设时间"
+    if (adcContinuousMode) {
+      adcContinuousMode = false;
+      Serial.println("adc continuous output off, back to >1% triggered output");
+    } else {
+      setTimeCmd("T 20260909 090000");   // 测试快捷键:快速设成 2026-09-09 09:00:00
+    }
+  }
   else if (!strcmp(s, "cal"))                  startCalMonitor();  // 纯校准调试:10s 标定 + 持续打印 raw/电压
+  else if (!strcmp(s, "adccnt"))               startAdcContinuous();  // 每次采样都输出,不用等 >1%
   else if (parseLevelSelection(s, &lvl))       selectZeroLevel(lvl);  // 标定后选 1~10 挡
   else if (!strcmp(s, "ledoff"))                setHeartbeat(false);  // 关闭心跳 LED(振动指示灯不受影响)
   else if (!strcmp(s, "ledon"))                 setHeartbeat(true);   // 重新打开心跳 LED
